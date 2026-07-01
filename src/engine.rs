@@ -259,11 +259,10 @@ pub async fn run_once(pool: &PgPool, config: &Config) -> anyhow::Result<CycleRep
         });
     }
 
-    let measured = trial
-        .impact
-        .as_ref()
-        .map(|m| format!("{:+.1}% measured latency", m.improvement_pct))
-        .unwrap_or_else(|| "applied (measured gate disabled)".into());
+    let measured = match &trial.impact {
+        Some(m) => format!("{:+.1}% measured latency", m.improvement_pct),
+        None => format!("kept ({})", trial.measured_on),
+    };
     println!(
         "✓ applied {} (history #{}) — {}",
         best.index.index_name(),
@@ -319,16 +318,44 @@ async fn measured_trial(
     } else {
         "primary (in-place)"
     };
+
+    // Build the measurable set. Concrete queries are used as-is; parameterized
+    // (captured) queries are concretized by sampling real parameter values, so
+    // the measured gate applies to them too. Whatever can't be concretized is
+    // left to the estimated gate.
+    let mut concrete: Vec<catalog::WorkloadQuery> = Vec::new();
+    for w in workload {
+        if let Some(sql) = telemetry::concretize(target, w).await? {
+            concrete.push(catalog::WorkloadQuery {
+                query_text: sql,
+                parameterized: false,
+                ..w.clone()
+            });
+        }
+    }
+    if concrete.is_empty() {
+        // Nothing measurable (e.g. captured queries we couldn't concretize):
+        // apply on the estimated gate that already passed.
+        apply::build_index_online(pool, index).await?;
+        return Ok(Trial {
+            impact: None,
+            kept: true,
+            measured_on: "estimated-only",
+            note: "no measurable (concretizable) queries; validated by estimated generic-plan cost"
+                .into(),
+        });
+    }
     println!(
-        "▸ measured trial on {where_}: EXPLAIN (ANALYZE) × {} samples…",
-        mcfg.samples
+        "▸ measured trial on {where_}: EXPLAIN (ANALYZE) × {} samples ({} queries)…",
+        mcfg.samples,
+        concrete.len()
     );
 
-    let baseline = measure::measure(target, workload, mcfg.samples).await?;
+    let baseline = measure::measure(target, &concrete, mcfg.samples).await?;
     apply::build_index_online(target, index).await?;
     // The trial index now exists on `target`; ensure it is removed on any error
     // path below, not just the normal keep/reject branches.
-    let candidate = match measure::measure(target, workload, mcfg.samples).await {
+    let candidate = match measure::measure(target, &concrete, mcfg.samples).await {
         Ok(c) => c,
         Err(e) => {
             let _ = apply::drop_index_online(target, index).await;
@@ -338,7 +365,7 @@ async fn measured_trial(
     let impact = measure::summarize(
         &baseline,
         &candidate,
-        workload,
+        &concrete,
         mcfg.samples,
         mcfg.noise_floor_ms,
     );

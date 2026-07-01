@@ -7,8 +7,8 @@ use std::collections::HashMap;
 
 use serde_json::{json, Value};
 use sqlparser::ast::{
-    Expr, GroupByExpr, Join, JoinConstraint, JoinOperator, Query, Select, SetExpr, Statement,
-    TableFactor, TableWithJoins,
+    Expr, GroupByExpr, Join, JoinConstraint, JoinOperator, Offset, Query, Select, SetExpr,
+    Statement, TableFactor, TableWithJoins, Value as SqlValue,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -132,6 +132,377 @@ async fn query_stats(pool: &PgPool) -> anyhow::Result<Value> {
         })
         .collect();
     Ok(Value::Array(arr))
+}
+
+// --------------------------------------------------------------------------
+// Automatic workload capture (self-driving)
+// --------------------------------------------------------------------------
+
+/// Populate `pistol.workload` from `pg_stat_statements` — the real hot queries,
+/// ranked by total execution time. Stores the normalized (parameterized) text,
+/// which is evaluated via `EXPLAIN (GENERIC_PLAN)`. Only read queries that (a)
+/// don't touch pistol/system objects and (b) yield at least one index candidate
+/// are kept. Returns the number captured.
+pub async fn capture_workload(pool: &PgPool, min_calls: i64, limit: i64) -> anyhow::Result<usize> {
+    let rows = match sqlx::query(
+        "SELECT queryid, query, calls
+           FROM pg_stat_statements
+          WHERE calls >= $1
+          ORDER BY total_exec_time DESC
+          LIMIT $2",
+    )
+    .bind(min_calls)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("42P01") => {
+            anyhow::bail!("pg_stat_statements not available; cannot capture workload");
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let mut captured = 0usize;
+    for r in rows {
+        let queryid: Option<i64> = r.get("queryid");
+        let query: String = r.get("query");
+        let calls: i64 = r.get("calls");
+        // Cheap textual pre-filter, then a real parse-based read-only guard so a
+        // writable CTE (WITH … AS (DELETE …)) or multi-statement text is never
+        // stored / later executed.
+        if !is_capturable(&query) || !is_read_only_single(&query) {
+            continue;
+        }
+        // Keep only queries that actually yield an indexable candidate.
+        let probe = WorkloadQuery {
+            fingerprint: "probe".into(),
+            query_text: query.clone(),
+            weight: 1.0,
+            label: None,
+            parameterized: query.contains('$'),
+        };
+        if candidates_from_workload(std::slice::from_ref(&probe)).is_empty() {
+            continue;
+        }
+        let fingerprint = match queryid {
+            Some(id) => format!("pgss-{id}"),
+            None => format!("pgss-{:016x}", stable_hash(&query)),
+        };
+        let wq = WorkloadQuery {
+            fingerprint,
+            label: Some(query.chars().take(60).collect()),
+            parameterized: query.contains('$'),
+            query_text: query,
+            weight: calls as f64,
+        };
+        catalog::upsert_workload(pool, &wq).await?;
+        captured += 1;
+    }
+    Ok(captured)
+}
+
+/// Cheap textual pre-filter for capture: read statements only, and never our own
+/// telemetry/system queries.
+fn is_capturable(q: &str) -> bool {
+    let up = q.trim_start().to_uppercase();
+    if !(up.starts_with("SELECT") || up.starts_with("WITH")) || up.contains("EXPLAIN") {
+        return false;
+    }
+    let low = q.to_lowercase();
+    !(low.contains("pg_stat_statements")
+        || low.contains("hypopg")
+        || low.contains("pistol.")
+        || low.contains("information_schema")
+        || low.contains("pg_catalog")
+        || low.contains("pg_relation_size")
+        || low.contains("pg_indexes"))
+}
+
+fn stable_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// True only if `sql` is exactly ONE read-only statement (a `SELECT`/`VALUES`/
+/// `TABLE`/CTE query with no data-modifying CTE). Used to gate the simple-query
+/// (`raw_sql`) EXPLAIN path and workload capture, so a multi-statement or
+/// writable query from the catalog can never be executed.
+pub fn is_read_only_single(sql: &str) -> bool {
+    let dialect = PostgreSqlDialect {};
+    let stmts = match Parser::parse_sql(&dialect, sql) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    if stmts.len() != 1 {
+        return false;
+    }
+    matches!(&stmts[0], Statement::Query(q) if query_is_read_only(q))
+}
+
+fn query_is_read_only(q: &Query) -> bool {
+    if let Some(with) = &q.with {
+        if with
+            .cte_tables
+            .iter()
+            .any(|cte| !query_is_read_only(&cte.query))
+        {
+            return false;
+        }
+    }
+    set_expr_read_only(q.body.as_ref())
+}
+
+fn set_expr_read_only(se: &SetExpr) -> bool {
+    match se {
+        SetExpr::Select(_) | SetExpr::Values(_) | SetExpr::Table(_) => true,
+        SetExpr::Query(q) => query_is_read_only(q),
+        SetExpr::SetOperation { left, right, .. } => {
+            set_expr_read_only(left) && set_expr_read_only(right)
+        }
+        // Insert/Update (data-modifying CTEs) and anything unrecognized: reject.
+        _ => false,
+    }
+}
+
+// --------------------------------------------------------------------------
+// Concrete-parameter sampling — make captured (parameterized) queries
+// EXPLAIN (ANALYZE)-able so the measured gate applies to them too.
+// --------------------------------------------------------------------------
+
+/// What a `$N` placeholder binds to.
+#[derive(Debug, Clone)]
+enum ParamBind {
+    Column {
+        schema: String,
+        table: String,
+        column: String,
+    },
+    Limit,
+    Offset,
+}
+
+/// Turn a parameterized query into a concrete, runnable one by substituting each
+/// `$N` with a sampled value (predicate columns) or a constant (LIMIT/OFFSET).
+/// Returns `None` if the query can't be fully concretized (any placeholder we
+/// can't classify, or a column we can't sample) — the caller then keeps it on
+/// the estimated gate. Non-parameterized queries are returned unchanged.
+pub async fn concretize(pool: &PgPool, wq: &WorkloadQuery) -> anyhow::Result<Option<String>> {
+    if !wq.parameterized {
+        return Ok(Some(wq.query_text.clone()));
+    }
+    let binds = match analyze_placeholders(&wq.query_text) {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    let mut subs: HashMap<u32, String> = HashMap::new();
+    for (ord, bind) in &binds {
+        let lit = match bind {
+            ParamBind::Limit => "100".to_string(),
+            ParamBind::Offset => "0".to_string(),
+            ParamBind::Column {
+                schema,
+                table,
+                column,
+            } => match sample_literal(pool, schema, table, column).await {
+                Some(l) => l,
+                None => return Ok(None),
+            },
+        };
+        subs.insert(*ord, lit);
+    }
+    Ok(Some(substitute_placeholders(&wq.query_text, &subs)))
+}
+
+/// Classify every `$N` in the query. Returns `None` unless *all* placeholders
+/// are accounted for (so we never produce SQL that still contains a `$N`).
+fn analyze_placeholders(sql: &str) -> Option<HashMap<u32, ParamBind>> {
+    let dialect = PostgreSqlDialect {};
+    let q = match Parser::parse_sql(&dialect, sql).ok()?.into_iter().next()? {
+        Statement::Query(q) => q,
+        _ => return None,
+    };
+    let mut binds = HashMap::new();
+    classify_query(&q, &mut binds);
+    for ord in placeholder_ordinals(sql) {
+        if !binds.contains_key(&ord) {
+            return None; // an unclassified placeholder — bail
+        }
+    }
+    Some(binds)
+}
+
+fn classify_query(q: &Query, binds: &mut HashMap<u32, ParamBind>) {
+    if let SetExpr::Select(select) = q.body.as_ref() {
+        let aliases = build_alias_map(&select.from);
+        let base = single_base_table(&select.from);
+        if let Some(sel) = &select.selection {
+            classify_expr(sel, &aliases, &base, binds);
+        }
+        for twj in &select.from {
+            for j in &twj.joins {
+                if let Some(e) = join_on(j) {
+                    classify_expr(e, &aliases, &base, binds);
+                }
+            }
+        }
+    }
+    if let Some(limit) = &q.limit {
+        if let Some(ord) = placeholder_ordinal(limit) {
+            binds.insert(ord, ParamBind::Limit);
+        }
+    }
+    if let Some(Offset { value, .. }) = &q.offset {
+        if let Some(ord) = placeholder_ordinal(value) {
+            binds.insert(ord, ParamBind::Offset);
+        }
+    }
+}
+
+fn classify_expr(
+    expr: &Expr,
+    aliases: &HashMap<String, (String, String)>,
+    base: &Option<(String, String)>,
+    binds: &mut HashMap<u32, ParamBind>,
+) {
+    use sqlparser::ast::BinaryOperator as Op;
+    match expr {
+        Expr::BinaryOp { left, op, right } => match op {
+            Op::And | Op::Or => {
+                classify_expr(left, aliases, base, binds);
+                classify_expr(right, aliases, base, binds);
+            }
+            Op::Eq | Op::Gt | Op::Lt | Op::GtEq | Op::LtEq | Op::NotEq => {
+                bind_comparison(left, right, aliases, base, binds);
+            }
+            _ => {}
+        },
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            if let Some(col) = resolve_column(expr, aliases, base) {
+                for side in [low.as_ref(), high.as_ref()] {
+                    if let Some(ord) = placeholder_ordinal(side) {
+                        binds.insert(ord, to_column_bind(&col));
+                    }
+                }
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            if let Some(col) = resolve_column(expr, aliases, base) {
+                for e in list {
+                    if let Some(ord) = placeholder_ordinal(e) {
+                        binds.insert(ord, to_column_bind(&col));
+                    }
+                }
+            }
+        }
+        Expr::Nested(inner) => classify_expr(inner, aliases, base, binds),
+        _ => {}
+    }
+}
+
+/// Bind whichever side of a comparison is a placeholder to the column on the
+/// other side.
+fn bind_comparison(
+    left: &Expr,
+    right: &Expr,
+    aliases: &HashMap<String, (String, String)>,
+    base: &Option<(String, String)>,
+    binds: &mut HashMap<u32, ParamBind>,
+) {
+    if let (Some(col), Some(ord)) = (
+        resolve_column(left, aliases, base),
+        placeholder_ordinal(right),
+    ) {
+        binds.insert(ord, to_column_bind(&col));
+    } else if let (Some(col), Some(ord)) = (
+        resolve_column(right, aliases, base),
+        placeholder_ordinal(left),
+    ) {
+        binds.insert(ord, to_column_bind(&col));
+    }
+}
+
+fn to_column_bind(col: &((String, String), String)) -> ParamBind {
+    ParamBind::Column {
+        schema: col.0 .0.clone(),
+        table: col.0 .1.clone(),
+        column: col.1.clone(),
+    }
+}
+
+fn join_on(j: &Join) -> Option<&Expr> {
+    match &j.join_operator {
+        JoinOperator::Inner(JoinConstraint::On(e))
+        | JoinOperator::LeftOuter(JoinConstraint::On(e))
+        | JoinOperator::RightOuter(JoinConstraint::On(e))
+        | JoinOperator::FullOuter(JoinConstraint::On(e)) => Some(e),
+        _ => None,
+    }
+}
+
+fn placeholder_ordinal(expr: &Expr) -> Option<u32> {
+    match expr {
+        Expr::Value(SqlValue::Placeholder(s)) => s.strip_prefix('$')?.parse().ok(),
+        _ => None,
+    }
+}
+
+/// All `$N` ordinals appearing in the raw text (source of truth for coverage).
+fn placeholder_ordinals(sql: &str) -> Vec<u32> {
+    let bytes = sql.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > i + 1 {
+                if let Ok(n) = sql[i + 1..j].parse::<u32>() {
+                    out.push(n);
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Substitute `$N` tokens with their literals. Replaces highest ordinals first
+/// so `$1` never matches inside `$10`.
+fn substitute_placeholders(sql: &str, subs: &HashMap<u32, String>) -> String {
+    let mut ords: Vec<&u32> = subs.keys().collect();
+    ords.sort_by(|a, b| b.cmp(a));
+    let mut out = sql.to_string();
+    for ord in ords {
+        out = out.replace(&format!("${ord}"), &subs[ord]);
+    }
+    out
+}
+
+/// Sample one existing value from a column as a correctly-escaped SQL literal
+/// (via `quote_nullable`). The resulting unknown-type literal coerces to the
+/// column type in the comparison, giving a representative plan.
+async fn sample_literal(pool: &PgPool, schema: &str, table: &str, column: &str) -> Option<String> {
+    let sql = format!(
+        "SELECT quote_nullable(\"{column}\"::text)
+           FROM \"{schema}\".\"{table}\"
+          WHERE \"{column}\" IS NOT NULL
+          LIMIT 1"
+    );
+    sqlx::query_scalar::<_, Option<String>>(&sql)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten()
 }
 
 // --------------------------------------------------------------------------
@@ -487,5 +858,90 @@ fn object_name_to_schema_table(name: &sqlparser::ast::ObjectName) -> (String, St
             parts[parts.len() - 2].value.clone(),
             parts[parts.len() - 1].value.clone(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wq(sql: &str) -> WorkloadQuery {
+        WorkloadQuery {
+            fingerprint: "t".into(),
+            query_text: sql.into(),
+            weight: 1.0,
+            label: None,
+            parameterized: sql.contains('$'),
+        }
+    }
+
+    #[test]
+    fn parameterized_query_yields_candidates() {
+        // A normalized (pg_stat_statements-style) query with $N placeholders
+        // must still parse and produce an equality + sort candidate.
+        let w = vec![wq(
+            "SELECT id FROM student_progress WHERE student_id = $1 ORDER BY created_at DESC LIMIT $2",
+        )];
+        let cands = candidates_from_workload(&w);
+        let sp = cands
+            .iter()
+            .find(|c| c.table == "student_progress")
+            .expect("candidate for student_progress");
+        assert!(sp.eq_columns.iter().any(|c| c == "student_id"));
+        assert!(sp
+            .sort_columns
+            .iter()
+            .any(|(c, desc)| c == "created_at" && *desc));
+    }
+
+    #[test]
+    fn analyze_placeholders_classifies_predicate_and_limit() {
+        let binds = analyze_placeholders(
+            "SELECT id FROM student_progress WHERE student_id = $1 ORDER BY created_at DESC LIMIT $2",
+        )
+        .expect("all placeholders classified");
+        assert!(
+            matches!(binds.get(&1), Some(ParamBind::Column { column, .. }) if column == "student_id")
+        );
+        assert!(matches!(binds.get(&2), Some(ParamBind::Limit)));
+    }
+
+    #[test]
+    fn analyze_placeholders_bails_on_unclassifiable() {
+        // $1 is in the SELECT list, not a predicate/limit -> can't concretize.
+        assert!(analyze_placeholders("SELECT $1 FROM student_progress LIMIT $2").is_none());
+    }
+
+    #[test]
+    fn substitute_replaces_longest_ordinal_first() {
+        let mut subs = HashMap::new();
+        subs.insert(1u32, "'a'".to_string());
+        subs.insert(10u32, "'b'".to_string());
+        let out = substitute_placeholders("x = $1 AND y = $10", &subs);
+        assert_eq!(out, "x = 'a' AND y = 'b'");
+    }
+
+    #[test]
+    fn read_only_guard_rejects_multi_statement_and_writable_ctes() {
+        assert!(is_read_only_single("SELECT a FROM t WHERE x = $1"));
+        assert!(is_read_only_single(
+            "WITH r AS (SELECT id FROM t WHERE x = 1) SELECT * FROM r"
+        ));
+        // Multiple statements (the injection vector for the simple protocol).
+        assert!(!is_read_only_single("SELECT 1; DROP TABLE t"));
+        // Data-modifying CTE wrapped in a SELECT.
+        assert!(!is_read_only_single(
+            "WITH d AS (DELETE FROM t RETURNING id) SELECT * FROM d"
+        ));
+        assert!(!is_read_only_single("UPDATE t SET x = 1"));
+    }
+
+    #[test]
+    fn is_capturable_filters_system_and_writes() {
+        assert!(is_capturable("SELECT a FROM t WHERE x = $1"));
+        assert!(!is_capturable("EXPLAIN (ANALYZE) SELECT 1"));
+        assert!(!is_capturable("UPDATE t SET x = 1"));
+        assert!(!is_capturable("SELECT * FROM pg_catalog.pg_class"));
+        assert!(!is_capturable("SELECT * FROM pistol.workload"));
     }
 }

@@ -88,6 +88,7 @@ pub fn workload_queries() -> Vec<WorkloadQuery> {
         query_text: sql.trim().to_string(),
         weight: w,
         label: Some(fp.to_string()),
+        parameterized: false, // concrete literals — measurable with EXPLAIN ANALYZE
     };
     vec![
         q("student_dashboard", 40.0,

@@ -12,13 +12,17 @@ use sqlx::{PgPool, Row};
 
 use crate::genome::{Genome, IndexSpec};
 
-/// A concrete, EXPLAIN-able representative query with its call frequency.
+/// A representative query with its call frequency. `parameterized` marks a
+/// normalized query captured from pg_stat_statements (evaluated via
+/// GENERIC_PLAN); concrete queries (parameterized = false) can also be timed
+/// with EXPLAIN (ANALYZE).
 #[derive(Debug, Clone)]
 pub struct WorkloadQuery {
     pub fingerprint: String,
     pub query_text: String,
     pub weight: f64,
     pub label: Option<String>,
+    pub parameterized: bool,
 }
 
 /// Per-table write pressure, used for the write-amplification penalty.
@@ -34,9 +38,11 @@ pub struct TableStat {
 // --------------------------------------------------------------------------
 
 pub async fn fetch_workload(pool: &PgPool) -> anyhow::Result<Vec<WorkloadQuery>> {
-    let rows = sqlx::query("SELECT fingerprint, query_text, weight, label FROM pistol.workload")
-        .fetch_all(pool)
-        .await?;
+    let rows = sqlx::query(
+        "SELECT fingerprint, query_text, weight, label, parameterized FROM pistol.workload",
+    )
+    .fetch_all(pool)
+    .await?;
     Ok(rows
         .into_iter()
         .map(|r| WorkloadQuery {
@@ -44,24 +50,27 @@ pub async fn fetch_workload(pool: &PgPool) -> anyhow::Result<Vec<WorkloadQuery>>
             query_text: r.get("query_text"),
             weight: r.get("weight"),
             label: r.get("label"),
+            parameterized: r.get("parameterized"),
         })
         .collect())
 }
 
 pub async fn upsert_workload(pool: &PgPool, q: &WorkloadQuery) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT INTO pistol.workload (fingerprint, query_text, weight, label, updated_at)
-         VALUES ($1, $2, $3, $4, now())
+        "INSERT INTO pistol.workload (fingerprint, query_text, weight, label, parameterized, updated_at)
+         VALUES ($1, $2, $3, $4, $5, now())
          ON CONFLICT (fingerprint) DO UPDATE
            SET query_text = EXCLUDED.query_text,
                weight = EXCLUDED.weight,
                label = EXCLUDED.label,
+               parameterized = EXCLUDED.parameterized,
                updated_at = now()",
     )
     .bind(&q.fingerprint)
     .bind(&q.query_text)
     .bind(q.weight)
     .bind(&q.label)
+    .bind(q.parameterized)
     .execute(pool)
     .await?;
     Ok(())

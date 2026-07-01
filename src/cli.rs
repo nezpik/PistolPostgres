@@ -33,6 +33,8 @@ pub enum Command {
     /// Demo helpers: build schema, seed data, load the workload.
     #[command(subcommand)]
     Demo(DemoCmd),
+    /// Capture the real workload from pg_stat_statements into pistol.workload.
+    Capture(CaptureArgs),
     /// Collect a telemetry snapshot and show derived index candidates.
     Collect,
     /// Run the evolutionary search and print ranked proposals (no changes).
@@ -64,6 +66,16 @@ pub struct DemoAllArgs {
     /// Workload exercise iterations.
     #[arg(long, default_value_t = 20)]
     pub iterations: u32,
+}
+
+#[derive(Args)]
+pub struct CaptureArgs {
+    /// Only capture queries called at least this many times.
+    #[arg(long, default_value_t = 5)]
+    pub min_calls: u32,
+    /// Max number of (hottest) queries to capture.
+    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..))]
+    pub limit: u32,
 }
 
 #[derive(Args)]
@@ -115,12 +127,29 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 demo::load(&pool, a.iterations).await?;
             }
         },
+        Command::Capture(a) => capture(&pool, a).await?,
         Command::Collect => collect(&pool).await?,
         Command::Propose => propose(&pool, &config).await?,
         Command::Run(a) => run(&pool, &config, a).await?,
         Command::Status => status(&pool).await?,
         Command::History(a) => history(&pool, a.limit).await?,
         Command::Rollback(a) => rollback(&pool, a.id).await?,
+    }
+    Ok(())
+}
+
+async fn capture(pool: &PgPool, args: CaptureArgs) -> anyhow::Result<()> {
+    let n = telemetry::capture_workload(pool, args.min_calls as i64, args.limit as i64).await?;
+    println!(
+        "✓ captured {n} workload quer{} from pg_stat_statements (min_calls={}, limit={})",
+        if n == 1 { "y" } else { "ies" },
+        args.min_calls,
+        args.limit
+    );
+    if n > 0 {
+        println!("  run `pistol collect` to see derived candidates, or `pistol run` to evolve.");
+    } else {
+        println!("  nothing captured yet — exercise your app so pg_stat_statements has data.");
     }
     Ok(())
 }

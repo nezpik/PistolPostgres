@@ -67,6 +67,29 @@ Candidates are then **validated against `information_schema.columns`** so that
 SELECT-list aliases leaking through `ORDER BY <alias>` (e.g. `... AS total`) can
 never produce an unbuildable index.
 
+## Automatic workload capture (`telemetry::capture_workload`)
+
+`pistol capture` makes the engine self-driving on a real database: it reads the
+hottest queries from `pg_stat_statements` (ranked by total execution time),
+filters to read statements that don't touch pistol/system objects and that yield
+at least one index candidate, and stores their **normalized** text in
+`pistol.workload` with `parameterized = true`.
+
+Because captured queries carry `$1`-style placeholders:
+
+- **Proposal/evaluation (Tier 1)** plans them with `EXPLAIN (GENERIC_PLAN)`
+  (PG16+), which plans a parameterized statement without values — and hypopg's
+  hypothetical indexes are still considered, so the whole search works on
+  captured queries. This must run over the **simple** query protocol (`raw_sql`);
+  under the prepared protocol Postgres treats `$1` as a bind parameter and
+  rejects it.
+- **Measured gate (Tier 2)** needs real values to `EXPLAIN (ANALYZE)`, so it runs
+  only over the *concrete* subset of the workload. A purely parameterized
+  workload is kept on the estimated generic-plan gate (`measured_on =
+  "estimated-only"`); provenance records `predicted` rather than `measured`.
+  Restoring measured validation for captured queries — by sampling concrete
+  parameter values per predicate column — is the next follow-on.
+
 ## Evolutionary proposer (`src/proposer/evolutionary.rs`)
 
 - An *individual* is one `IndexSpec` (an ordered column list on a table).
@@ -186,9 +209,12 @@ index cap, daily storage budget. Autonomy levels: `advisory` (record only),
 
 - Change types limited to B-tree indexes; MV/partition/schema-extension seams
   exist but are unimplemented.
-- The measured gate uses real `EXPLAIN (ANALYZE)` latency, but on the *registered
-  representative* workload; automatic capture of concrete production queries
-  (via `auto_explain`/sampling) is the next step to true self-driving.
+- Workload capture (`pistol capture`) pulls **normalized** queries from
+  `pg_stat_statements`, which the proposal/estimation tier fully self-drives via
+  `GENERIC_PLAN`. The measured Tier-2 gate still needs concrete values, so
+  captured (parameterized) queries currently fall back to the estimated gate;
+  sampling concrete parameter values per predicate column (to restore measured
+  validation for captured queries) is the next step.
 - Shadow measurement expects an operator-provided replica/branch URL; we don't
   yet provision it (blueprint's Supabase-branch integration, Phase 2).
 - No learned cost models, no pgrx in-core extension yet (blueprint Phase 3).

@@ -53,7 +53,7 @@ impl<'a> Evaluator<'a> {
         let mut baseline = HashMap::new();
         let mut baseline_total = 0.0;
         for q in workload {
-            let cost = plan_total_cost(&mut conn, &q.query_text).await?;
+            let cost = plan_total_cost(&mut conn, &q.query_text, q.parameterized).await?;
             baseline.insert(q.fingerprint.clone(), cost);
             baseline_total += cost * q.weight;
         }
@@ -98,7 +98,8 @@ impl<'a> Evaluator<'a> {
 
             for q in &self.workload {
                 let baseline_cost = *self.baseline.get(&q.fingerprint).unwrap_or(&0.0);
-                let candidate_cost = plan_total_cost(&mut conn, &q.query_text).await?;
+                let candidate_cost =
+                    plan_total_cost(&mut conn, &q.query_text, q.parameterized).await?;
                 candidate_total += candidate_cost * q.weight;
 
                 let improvement_pct = if baseline_cost > 0.0 {
@@ -154,10 +155,38 @@ async fn hypopg_reset(conn: &mut PgConnection) -> anyhow::Result<()> {
 }
 
 /// Parse the top-plan-node total cost out of `EXPLAIN (FORMAT JSON)`.
-pub async fn plan_total_cost(conn: &mut PgConnection, sql: &str) -> anyhow::Result<f64> {
-    let row = sqlx::query(&format!("EXPLAIN (FORMAT JSON) {sql}"))
-        .fetch_one(&mut *conn)
-        .await?;
+/// Parameterized (captured) queries are planned with `GENERIC_PLAN` (PG16+),
+/// which plans a `$1`-style statement without executing or needing values;
+/// hypopg's hypothetical indexes are still considered.
+pub async fn plan_total_cost(
+    conn: &mut PgConnection,
+    sql: &str,
+    parameterized: bool,
+) -> anyhow::Result<f64> {
+    let explain = if parameterized {
+        format!("EXPLAIN (GENERIC_PLAN, FORMAT JSON) {sql}")
+    } else {
+        format!("EXPLAIN (FORMAT JSON) {sql}")
+    };
+    // Parameterized queries must go through the SIMPLE query protocol: under the
+    // prepared/extended protocol Postgres treats `$1` as a bind parameter (and
+    // errors that 0 were supplied), whereas GENERIC_PLAN needs them as
+    // placeholders. `raw_sql` uses the simple protocol.
+    let row = if parameterized {
+        // The simple protocol executes every `;`-separated statement, so refuse
+        // anything that isn't a single read-only query before running it.
+        if !crate::telemetry::is_read_only_single(sql) {
+            anyhow::bail!("refusing to plan a non-read-only or multi-statement query");
+        }
+        sqlx::raw_sql(&explain)
+            .fetch_all(&mut *conn)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("EXPLAIN returned no rows"))?
+    } else {
+        sqlx::query(&explain).fetch_one(&mut *conn).await?
+    };
     // The QUERY PLAN column is json; fall back to text just in case.
     let v: serde_json::Value = match row.try_get::<serde_json::Value, _>(0) {
         Ok(v) => v,
