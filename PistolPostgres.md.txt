@@ -1,0 +1,341 @@
+# PistolPostgres
+
+**Precision Intelligent Self-evolving & Optimizing Layer for Postgres**
+
+**Version:** 0.1 (Initial Blueprint)  
+**Date:** July 2026  
+**Status:** Design Phase  
+**Core Principle:** Reliable self-modification through controlled, explainable, evolutionary intelligence on a battle-tested Postgres foundation.
+
+---
+
+## 1. Executive Summary & Vision
+
+PistolPostgres is a hybrid, middle-ground database architecture that transforms a standard Postgres (or Supabase) instance into a **self-improving system**. It keeps the proven Postgres storage engine, MVCC, WAL/recovery, query planner, and concurrency model untouched for maximum reliability, while adding a dedicated **Evolution Intelligence Layer** that continuously analyzes workload, proposes structural improvements, evaluates them safely, and applies beneficial changes in a controlled, auditable, and reversible manner.
+
+### The Core Vision
+A Postgres database that **gets better over time by itself** — adapting its physical design (indexes, partitions, materialized views) and safe schema extensions to real usage patterns, without requiring constant manual DBA work or risky ad-hoc migrations.
+
+### Why "PistolPostgres"?
+- **Precision**: Every change is targeted, data-driven, and evaluated before application ("one precise shot").
+- **Intelligent**: LLM/agent-driven proposals combined with evolutionary/stochastic search.
+- **Controlled & Reliable**: Strong safety rails, provenance, sandbox testing, and rollback — built on Postgres's rock-solid foundation.
+- **Differentiating Hook**: Evolutionary non-determinism in the *proposal* phase + full auditability of self-modification, something missing from both traditional advisors and full autonomous databases.
+
+This directly addresses the original goal: a database with a **precise, striking, technically differentiating value** that solves real problems (performance drift + schema debt) in an intelligent yet controlled way.
+
+---
+
+## 2. Problem Statement & Value Proposition
+
+### The Problem
+Modern applications (especially edtech, AI-powered, or fast-iterating products) suffer from:
+- **Performance drift**: Query patterns change as features grow (new Massar integrations, realtime social features, AI agent queries, multi-tenant scaling). Manually chosen indexes and physical layout become suboptimal.
+- **Schema/physical design debt**: Manual migrations are slow, error-prone, and lag behind application changes. Developers avoid complex optimizations.
+- **Lack of observability into "why" changes happen**: Most tools give recommendations without rich context or provenance.
+- **No safe automation**: Existing advisors (pganalyze, Azure autonomous tuning, hypopg-based tools) are mostly advisory or greedy/local. Full autonomous systems (Oracle) are proprietary and heavy.
+
+### The Differentiating Solution (PistolPostgres Hook)
+PistolPostgres provides **controlled evolutionary self-optimization**:
+- Background intelligence continuously explores better physical layouts using stochastic/evolutionary methods (escaping local optima that simple recommenders hit).
+- Every proposal is rigorously evaluated in sandbox conditions.
+- Changes are applied safely (preferring online DDL), fully logged with AI + metric rationale, and automatically monitored for regressions.
+- The system is **agent-native**: Your Hermes Agent can participate in or drive the evolution loop.
+- Result: The database "sharpens itself" over time — delivering better performance, lower costs, and less developer toil — while remaining trustworthy.
+
+**Primary Use Case Alignment**: Perfect for your Supabase-backed edtech application with 85+ tables, complex RLS, realtime features, and growing multi-tenant workloads. It reduces the "DBA tax" as the product scales and evolves.
+
+---
+
+## 3. Architecture Overview
+
+PistolPostgres follows a **hybrid layered architecture**:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Your Application + Hermes Agent               │
+│   (Edtech frontend, backend, AI agent that can query/drive evo)  │
+└───────────────────────────────┬─────────────────────────────────┘
+                                │ Evolution API (HTTP/gRPC or Postgres functions)
+┌───────────────────────────────▼─────────────────────────────────┐
+│              EVOLUTION INTELLIGENCE LAYER (Sidecar Service)      │
+│  Runs on Hetzner VPS (alongside Hermes) or as Supabase Edge Fn  │
+│                                                                  │
+│  ┌──────────────────────┐   ┌───────────────────────────────┐   │
+│  │   Telemetry Collector│   │   Proposal & Evolutionary     │   │
+│  │   (pg_stat_* + custom)│   │   Engine (LLM + Stochastic)   │   │
+│  └──────────┬───────────┘   └───────────────┬───────────────┘   │
+│             │                               │                     │
+│  ┌──────────▼───────────┐   ┌───────────────▼───────────────┐   │
+│  │ Evaluation Harness   │   │   Policy & Decision Engine    │   │
+│  │ (hypopg, replay,     │   │   (Thresholds, gates, fitness)│   │
+│  │  Supabase branches)  │   └───────────────┬───────────────┘   │
+│  └──────────┬───────────┘                   │                     │
+│             │                               │                     │
+│  ┌──────────▼───────────────────────────────▼──────────────────┐ │
+│  │           Provenance Store + Evolution Catalog (in Postgres)│ │
+│  └─────────────────────────────────────────────────────────────┘ │
+└───────────────────────────────┬─────────────────────────────────┘
+                                │ Safe DDL / Evolution Commands
+                                │ (CONCURRENTLY ops, custom RPCs, logical rep)
+┌───────────────────────────────▼─────────────────────────────────┐
+│                    POSTGRES CORE (Supabase or Self-hosted)       │
+│                                                                  │
+│  • Storage Engine, MVCC, WAL, Recovery, Query Planner/Executor   │
+│  • pg_stat_statements, hypopg, pgaudit, logical replication      │
+│  • Your 85+ tables + RLS + Realtime + Edge Functions             │
+│  • Custom extension (future) for deeper integration              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Design Principles**:
+- **Postgres owns data integrity and durability** — never bypass it.
+- **Evolution is observable and queryable** — the "self-changing" behavior lives in regular Postgres tables.
+- **Safety before autonomy** — graduated rollout from advisory → auto-safe-ops → broader evolution.
+- **Agent-first** — Hermes is a first-class citizen, not an afterthought.
+- **Evolutionary non-determinism** is confined to the low-risk proposal phase.
+
+---
+
+## 4. Detailed Component Breakdown
+
+### 4.1 Telemetry Collector
+- Primary sources: `pg_stat_statements`, `pg_stat_user_tables/indexes`, `pg_stat_activity`, table bloat stats, custom query logging where needed.
+- Enrichment: Capture representative workload samples or statistical summaries (query fingerprints, frequency, cost, cardinality estimates).
+- Storage: Time-series or aggregated data in dedicated `telemetry_*` tables (or exported to the intelligence service).
+- Goal: Provide rich, queryable context for proposals without heavy overhead.
+
+### 4.2 Proposal & Evolutionary Engine (The Intelligence Core)
+- **LLM Component**: Hermes Agent (or dedicated local model) receives structured context (schema subset, stats, sample queries, goals/SLOs, current genome state) and outputs candidate changes in structured JSON.
+- **Evolutionary / Stochastic Layer**:
+  - Maintains a small population of "DB genomes" (combinations of indexes, partition keys, materialized views, clustering strategies).
+  - Applies mutations (add/remove index, change partition column, adjust MV definition) and limited crossovers.
+  - Uses stochastic sampling or simple genetic algorithm steps to explore the space.
+  - Fitness function is multi-objective: estimated latency improvement, storage cost, write amplification, maintenance overhead, risk score, alignment with business SLOs.
+  - Inspiration from your RUIN framework: Stochastic processes can model "performance ruin" probability or workload evolution to decide when aggressive vs conservative exploration is warranted.
+- Output: Ranked list of high-quality proposals with rationale, predicted impact, and confidence.
+
+**Example Structured Proposal (JSON)**:
+```json
+{
+  "proposal_id": "evo-2026-07-01-001",
+  "type": "index_creation",
+  "target_table": "student_progress",
+  "ddl": "CREATE INDEX CONCURRENTLY idx_student_progress_student_id_created_at ON student_progress(student_id, created_at DESC);",
+  "rationale": "Hot query pattern on student dashboards + Massar syncs. High filter + sort cardinality. Estimated 40-60% latency reduction on top 5 queries.",
+  "predicted_impact": { "p99_latency_reduction_pct": 52, "storage_mb": 48, "write_amp_increase_pct": 3 },
+  "fitness_score": 0.87,
+  "confidence": 0.91,
+  "triggering_queries": ["qfp-abc123", "qfp-def456"],
+  "genome_variants_tested": 12
+}
+```
+
+### 4.3 Evaluation Harness (Safety Critical)
+- **hypopg** for zero-cost hypothetical index and (limited) other structure testing.
+- Sampled `EXPLAIN (ANALYZE, BUFFERS)` on representative queries or traces.
+- For higher-risk changes: Automatic creation/use of Supabase preview branches or logical replication replicas for realistic replay.
+- Regression detection thresholds (e.g., never apply if any regression > X% on key queries).
+- Cost modeling: Combine Postgres cost model with custom heuristics and LLM-estimated business value.
+
+### 4.4 Policy & Decision Engine
+Declarative policies stored in Postgres (editable table or YAML synced):
+- Auto-apply rules (e.g., "CREATE INDEX if predicted improvement > 30% AND no regression on write path AND table < 50GB").
+- Protected objects (never touch core auth/RLS tables automatically).
+- Resource limits (max indexes per table, max storage added per day).
+- Time windows and concurrency controls.
+- Approval requirements (human or Hermes sign-off for structural schema changes).
+- Graduated autonomy levels.
+
+### 4.5 Provenance & Evolution Catalog (The "Memory" of Self-Changes)
+All evolution activity is first-class data in Postgres. Key tables:
+
+```sql
+-- Core evolution history (immutable audit log)
+CREATE TABLE pistol_evolution_history (
+    id BIGSERIAL PRIMARY KEY,
+    applied_at TIMESTAMPTZ DEFAULT now(),
+    proposal_id TEXT,
+    change_type TEXT,                    -- 'index', 'partition', 'materialized_view', 'schema_extension'
+    target_object TEXT,
+    ddl_executed TEXT,
+    rationale TEXT,                      -- AI + metric explanation
+    before_metrics JSONB,
+    after_metrics JSONB,
+    actual_impact JSONB,
+    rollback_ddl TEXT,
+    triggered_by TEXT,                   -- 'auto', 'hermes', 'manual'
+    genome_context JSONB,
+    CONSTRAINT pistol_evolution_history_proposal_id_key UNIQUE (proposal_id)
+);
+
+-- Current active "genome" state for evolutionary tracking
+CREATE TABLE pistol_current_genome (
+    id BIGSERIAL PRIMARY KEY,
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    active_indexes JSONB,                -- structured representation
+    active_partitions JSONB,
+    active_mvs JSONB,
+    fitness_snapshot JSONB
+);
+
+-- Proposals queue / history
+CREATE TABLE pistol_proposals (
+    id TEXT PRIMARY KEY,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    status TEXT,                         -- 'proposed', 'evaluating', 'approved', 'applied', 'rejected', 'rolled_back'
+    proposal_json JSONB,
+    evaluation_results JSONB,
+    policy_decision JSONB,
+    applied_history_id BIGINT REFERENCES pistol_evolution_history(id)
+);
+```
+
+These tables enable powerful queries like: "Show me all changes that improved student dashboard p99 by >30% in the last 90 days" or "What is the current genome fitness trend?"
+
+### 4.6 Apply & Feedback Loop
+- **Apply Path**: Prefer `CREATE INDEX CONCURRENTLY`, online DDL where supported. Use advisory locks or low-traffic scheduling. For complex changes, leverage logical replication or Supabase branching.
+- **Post-Apply Monitoring**: Automatic comparison of key metrics (from telemetry) against predictions. Regression triggers alert + optional automatic rollback (via stored `rollback_ddl`).
+- **Learning Signal**: Outcomes feed back into the proposal engine (improves future LLM prompts and evolutionary fitness models).
+
+---
+
+## 5. Safety, Control & Reliability Mechanisms
+
+PistolPostgres is designed with **defense-in-depth**:
+
+1. **Evaluation before any change** — Nothing reaches production without hypopg + sampling or branch testing.
+2. **Policy gates** — Hard limits + human/agent approval for higher-risk operations.
+3. **Transactional & online-first** — Leverage Postgres primitives; avoid blocking operations.
+4. **Full provenance & immutability** — Evolution history cannot be tampered with easily.
+5. **Automatic regression detection + rollback** — Closed feedback loop.
+6. **Resource & blast-radius protection** — Policies prevent runaway behavior.
+7. **Crash safety** — All state lives in Postgres; recovery follows normal Postgres rules. Evolution steps are idempotent or have clear undo paths where possible.
+8. **Graduated autonomy** — Start in fully advisory mode; increase automation only after proven stability.
+9. **Testing discipline** — Property-based testing of proposal generation, crash injection during simulated evolution steps, workload replay suites.
+
+Data integrity is **never compromised** for the sake of self-modification.
+
+---
+
+## 6. Integration with Your Existing Stack
+
+- **Supabase**: 
+  - Evolution catalog tables live in your Supabase project (with appropriate RLS if multi-tenant concerns arise).
+  - Use Supabase branching for safe evaluation of larger changes.
+  - Edge Functions can host lightweight parts of the intelligence layer.
+  - Realtime can notify on important evolution events.
+- **Hermes Agent** (Hetzner):
+  - Primary brain for proposal generation and complex decision-making.
+  - Can be extended with new tools: `propose_evolution`, `evaluate_proposal`, `get_current_genome`, `get_evolution_history`.
+  - The DB becomes another high-value tool in Hermes' arsenal.
+- **Your Edtech App**:
+  - Dashboard views over `pistol_evolution_history` and `pistol_current_genome` for observability.
+  - Optional: Expose evolution status to school admins (transparency).
+- **Deployment**: Sidecar service (Rust/Go recommended for the intelligence layer) running alongside Hermes on Hetzner, or hybrid with Edge Functions for simpler components. Communicates with Postgres via standard connections + logical replication where needed.
+
+---
+
+## 7. Non-Deterministic & Evolutionary Aspects
+
+The "non-deterministic" quality lives primarily in the **proposal generation phase**:
+- Stochastic mutations and population-based search over physical design combinations.
+- Probabilistic elements in fitness scoring or workload forecasting (can draw from your RUIN stochastic modeling work).
+- Multiple candidate futures are explored cheaply; only the best, safest survivors are promoted to evaluation/apply.
+
+This gives better global optimization than pure greedy or single-LLM-shot recommenders, while the control layer ensures only safe, explainable changes ever touch production data.
+
+---
+
+## 8. Implementation Roadmap
+
+**Phase 0 – Foundations (1-2 weeks)**
+- Set up evolution catalog tables + basic telemetry collection.
+- Hermes tool integration for reading stats and proposing simple changes.
+- Advisory-only mode (proposals logged but never auto-applied).
+
+**Phase 1 – Core Hook (3-6 weeks)**
+- Full Proposal + Evaluation Harness with hypopg.
+- Policy engine + safe auto-apply for new B-tree indexes.
+- Rich provenance + basic dashboard views.
+- Background evolutionary search for index/partition candidates.
+
+**Phase 2 – Broader Evolution (2-3 months)**
+- Materialized view suggestions and management.
+- Safe schema extension proposals (new columns/tables with migration scripts).
+- Supabase branch integration for heavier testing.
+- Improved stochastic/evolutionary optimization + feedback learning.
+
+**Phase 3 – Deep Integration & Polish (Ongoing)**
+- Custom Postgres extension (pgrx/Rust) for tighter hooks (background workers, custom stats, new catalog views).
+- Learned cost/cardinality components (inspired by research like Bao/Neo).
+- Multi-tenant awareness and per-tenant evolution policies (valuable for your edtech scaling).
+- Advanced agent orchestration and "what-if" simulation UI.
+
+---
+
+## 9. Technical Choices & Trade-offs
+
+- **Language for Intelligence Layer**: Rust (preferred for safety + performance) or Go (faster iteration). Python acceptable for early prototypes.
+- **Communication**: Postgres functions/RPC for simple ops; dedicated HTTP/gRPC API for complex evolutionary workflows.
+- **Evaluation**: hypopg (proven, lightweight) + Supabase branching (powerful for realistic tests).
+- **Storage of Evolution State**: Regular Postgres tables (queryable, transactional, leverages your existing infra).
+- **Trade-off**: Slightly higher operational complexity (one extra service) vs. massive gains in reliability and development velocity compared to from-scratch. Much deeper self-modification capability than pure external advisors.
+
+---
+
+## 10. Risks & Mitigations
+
+| Risk                        | Mitigation                                                                 |
+|-----------------------------|----------------------------------------------------------------------------|
+| AI proposes harmful change  | Mandatory evaluation harness + conservative policies + rollback capability |
+| Performance regression      | Pre-apply prediction + post-apply automatic detection + rollback           |
+| Storage bloat               | Policy limits + fitness function penalizes unnecessary structures          |
+| Complexity / maintenance    | Start narrow (indexes), add features gradually; full provenance aids debugging |
+| Concurrency / locking issues| Prefer CONCURRENTLY operations; schedule during low-traffic windows        |
+| Data integrity during evo   | Never bypass Postgres transaction/recovery model; evolution steps are additive/safe |
+
+---
+
+## 11. Success Metrics (KPIs)
+
+- Reduction in p99/p95 latency on key user-facing queries over time.
+- Decrease in manual migration/index work (developer hours saved).
+- Evolution history query volume (shows the system is being used and trusted).
+- Ratio of auto-applied vs reviewed changes (gradual increase in autonomy).
+- Fitness trend of the active genome (improving or stable).
+- Regression rate after applied changes (target near-zero with rollback).
+- Storage efficiency (indexes/MVs added only when they deliver clear value).
+
+---
+
+## 12. Future Evolution Potential
+
+PistolPostgres is designed to grow:
+- Deeper Postgres integration via custom extensions.
+- Learned database components (query optimization, cardinality estimation).
+- Native support for vector/JSON workloads common in AI apps.
+- Self-tuning for HTAP or mixed workloads.
+- Open-source potential as a companion tool for the Supabase/Postgres ecosystem.
+- Integration with broader agentic systems beyond Hermes.
+
+It stands on the shoulders of Postgres while adding the missing "self-awareness and safe self-improvement" layer that modern AI-era applications need.
+
+---
+
+## 13. Next Steps & Call to Action
+
+1. Review and refine this blueprint (feedback welcome on scope, tables, policies, fitness function).
+2. Decide on initial scope for Phase 0/1 (e.g., focus exclusively on safe index evolution first).
+3. Set up the evolution catalog tables in a dev Supabase branch.
+4. Begin Hermes tool integration for telemetry reading and structured proposal generation.
+5. Implement the Evaluation Harness using hypopg.
+6. Iterate.
+
+This blueprint gives you a clear, actionable path to build something genuinely novel and valuable while staying grounded in reliable technology.
+
+**PistolPostgres** — Precision. Intelligence. Controlled evolution. On Postgres.
+
+---
+
+*Document generated as part of ongoing design collaboration. Ready for implementation planning.*
