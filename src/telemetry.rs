@@ -111,7 +111,13 @@ async fn query_stats(pool: &PgPool) -> anyhow::Result<Value> {
     .await;
     let rows = match rows {
         Ok(r) => r,
-        Err(_) => return Ok(Value::Array(vec![])),
+        // Only the "relation does not exist" case (extension not installed) is a
+        // benign "no data"; every other error is a real failure to surface.
+        Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("42P01") => {
+            tracing::warn!("pg_stat_statements not available; skipping query telemetry");
+            return Ok(Value::Array(vec![]));
+        }
+        Err(e) => return Err(e.into()),
     };
     let arr: Vec<Value> = rows
         .into_iter()
@@ -170,7 +176,9 @@ pub async fn candidates_validated(
         c.range_columns.retain(|x| keep(x));
         c.sort_columns.retain(|(x, _)| keep(x));
     }
-    candidates.retain(|c| !c.eq_columns.is_empty() || !c.sort_columns.is_empty());
+    candidates.retain(|c| {
+        !c.eq_columns.is_empty() || !c.sort_columns.is_empty() || !c.range_columns.is_empty()
+    });
     Ok(candidates)
 }
 
@@ -226,7 +234,14 @@ pub fn candidates_from_workload(workload: &[WorkloadQuery]) -> Vec<IndexCandidat
             support: a.support,
         })
         .collect();
-    out.sort_by(|x, y| y.support.partial_cmp(&x.support).unwrap());
+    // Sort by support desc, breaking ties on (schema, table) so equal-support
+    // workloads produce a deterministic candidate order.
+    out.sort_by(|x, y| {
+        y.support
+            .partial_cmp(&x.support)
+            .unwrap()
+            .then_with(|| (&x.schema, &x.table).cmp(&(&y.schema, &y.table)))
+    });
     out
 }
 
@@ -270,11 +285,11 @@ fn collect_query(q: &Query, weight: f64, acc: &mut HashMap<(String, String), Acc
         if let GroupByExpr::Expressions(exprs, _) = &select.group_by {
             for e in exprs {
                 if let Some((tbl, col)) = resolve_column(e, &aliases, &base) {
-                    touch(acc, &tbl, weight).eq.push((col, weight));
+                    touch(acc, &tbl).eq.push((col, weight));
                 }
             }
         }
-        collect_select_support(select, &aliases, &base, weight, acc);
+        collect_select_support(select, weight, acc);
     }
 
     // ORDER BY lives on the Query.
@@ -285,29 +300,32 @@ fn collect_query(q: &Query, weight: f64, acc: &mut HashMap<(String, String), Acc
             for ob in &order_by.exprs {
                 if let Some((tbl, col)) = resolve_column(&ob.expr, &aliases, &base) {
                     let desc = ob.asc == Some(false);
-                    touch(acc, &tbl, weight).sort.push((col, desc));
+                    touch(acc, &tbl).sort.push((col, desc));
                 }
             }
         }
     }
 }
 
-/// Ensure every base table in the query counts toward support even if it has no
-/// extractable predicate (keeps `support` meaningful).
-fn collect_select_support(
-    select: &Select,
-    _aliases: &HashMap<String, (String, String)>,
-    _base: &Option<(String, String)>,
-    weight: f64,
-    acc: &mut HashMap<(String, String), Acc>,
-) {
+/// Add this query's weight to `support` exactly once per distinct base table it
+/// references (support = summed weight of contributing queries), and ensure each
+/// table has an `acc` entry even with no extractable predicate.
+fn collect_select_support(select: &Select, weight: f64, acc: &mut HashMap<(String, String), Acc>) {
+    let mut seen = std::collections::HashSet::new();
+    let mut add = |tbl: (String, String), acc: &mut HashMap<(String, String), Acc>| {
+        let first_time = seen.insert(tbl.clone());
+        let e = acc.entry(tbl).or_default();
+        if first_time {
+            e.support += weight;
+        }
+    };
     for twj in &select.from {
         for tbl in tables_in(&twj.relation) {
-            touch(acc, &tbl, weight);
+            add(tbl, acc);
         }
         for j in &twj.joins {
             for tbl in tables_in(&j.relation) {
-                touch(acc, &tbl, weight);
+                add(tbl, acc);
             }
         }
     }
@@ -356,12 +374,12 @@ fn walk_predicate(
         },
         Expr::Between { expr, .. } => {
             if let Some((tbl, col)) = resolve_column(expr, aliases, base) {
-                touch(acc, &tbl, weight).range.push((col, weight));
+                touch(acc, &tbl).range.push((col, weight));
             }
         }
         Expr::InList { expr, .. } => {
             if let Some((tbl, col)) = resolve_column(expr, aliases, base) {
-                touch(acc, &tbl, weight).eq.push((col, weight));
+                touch(acc, &tbl).eq.push((col, weight));
             }
         }
         Expr::Nested(inner) => walk_predicate(inner, aliases, base, weight, acc),
@@ -381,7 +399,7 @@ fn record_side(
 ) {
     for side in [left, right] {
         if let Some((tbl, col)) = resolve_column(side, aliases, base) {
-            let entry = touch(acc, &tbl, weight);
+            let entry = touch(acc, &tbl);
             if is_eq {
                 entry.eq.push((col, weight));
             } else {
@@ -391,14 +409,10 @@ fn record_side(
     }
 }
 
-fn touch<'a>(
-    acc: &'a mut HashMap<(String, String), Acc>,
-    tbl: &(String, String),
-    weight: f64,
-) -> &'a mut Acc {
-    let e = acc.entry(tbl.clone()).or_default();
-    e.support += weight;
-    e
+/// Ensure a table's accumulator exists and return it (support is accounted for
+/// separately, once per query, in `collect_select_support`).
+fn touch<'a>(acc: &'a mut HashMap<(String, String), Acc>, tbl: &(String, String)) -> &'a mut Acc {
+    acc.entry(tbl.clone()).or_default()
 }
 
 /// Resolve an expression to a ((schema, table), column) reference, if it is a

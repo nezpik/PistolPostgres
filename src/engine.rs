@@ -91,7 +91,14 @@ pub async fn run_once(pool: &PgPool, config: &Config) -> anyhow::Result<CycleRep
     // 4. Take the single best proposal ("one precise shot").
     let mut best = proposals.into_iter().next().unwrap();
     let now = Utc::now();
-    best.id = format!("evo-{}-{}", now.format("%Y%m%d"), now.timestamp_millis());
+    // Include the index name so two proposals in the same millisecond can't
+    // collide (insert_proposal upserts on the primary key).
+    best.id = format!(
+        "evo-{}-{}-{}",
+        now.format("%Y%m%d"),
+        now.timestamp_millis(),
+        best.index.index_name()
+    );
     let eval = best.evaluation.clone().unwrap();
 
     catalog::insert_proposal(
@@ -363,7 +370,6 @@ async fn storage_added_today_mb(pool: &PgPool) -> anyhow::Result<f64> {
           WHERE status = 'applied' AND applied_at::date = now()::date",
     )
     .fetch_one(pool)
-    .await
-    .unwrap_or(Some(0.0));
+    .await?; // fail closed: never bypass the storage budget on a read error
     Ok(mb.unwrap_or(0.0))
 }

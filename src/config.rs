@@ -5,6 +5,9 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
+    // Defaulted so a partial pistol.toml (or none) still deserializes; the value
+    // is filled from PISTOL_DATABASE_URL/DATABASE_URL and validated in `load()`.
+    #[serde(default)]
     pub database_url: String,
     #[serde(default)]
     pub evolution: Evolution,
@@ -58,8 +61,9 @@ impl Default for Measure {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Evolution {
-    /// 0 (or absent) => seed from OS entropy (real exploration).
-    /// Any non-zero value => fully reproducible search (tests & demos).
+    /// `0` => seed from OS entropy (real exploration). Any non-zero value =>
+    /// fully reproducible search (tests & demos). Defaults to 42 (deterministic)
+    /// when the field is omitted.
     pub seed: u64,
     pub population_size: usize,
     pub generations: usize,

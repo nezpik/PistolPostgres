@@ -74,44 +74,60 @@ impl<'a> Evaluator<'a> {
         // INDEX parser, so we pass an unqualified table name and rely on the
         // connection's search_path (which resolves the target schema). Set the
         // search_path on your connection string for non-`public` schemas.
-        // Create the hypothetical index (hypopg rejects CONCURRENTLY).
-        let relid: i64 =
-            sqlx::query_scalar("SELECT indexrelid::bigint AS relid FROM hypopg_create_index($1)")
-                .bind(index.create_ddl_hypopg())
-                .fetch_one(&mut *conn)
-                .await?;
-
-        let storage_bytes: i64 = sqlx::query_scalar("SELECT hypopg_relation_size($1::oid)")
-            .bind(relid)
+        // Run the fallible evaluation inside a block so we can ALWAYS reset
+        // hypopg before returning the connection to the pool — otherwise an
+        // error mid-loop would leave hypothetical indexes contaminating the
+        // planner on the next reuse of this pooled session.
+        let computed: anyhow::Result<(i64, Vec<QueryDelta>, f64, f64)> = async {
+            // Create the hypothetical index (hypopg rejects CONCURRENTLY).
+            let relid: i64 = sqlx::query_scalar(
+                "SELECT indexrelid::bigint AS relid FROM hypopg_create_index($1)",
+            )
+            .bind(index.create_ddl_hypopg())
             .fetch_one(&mut *conn)
             .await?;
 
-        let mut per_query = Vec::new();
-        let mut candidate_total = 0.0;
-        let mut worst_regression_pct: f64 = 0.0;
+            let storage_bytes: i64 = sqlx::query_scalar("SELECT hypopg_relation_size($1::oid)")
+                .bind(relid)
+                .fetch_one(&mut *conn)
+                .await?;
 
-        for q in &self.workload {
-            let baseline_cost = *self.baseline.get(&q.fingerprint).unwrap_or(&0.0);
-            let candidate_cost = plan_total_cost(&mut conn, &q.query_text).await?;
-            candidate_total += candidate_cost * q.weight;
+            let mut per_query = Vec::new();
+            let mut candidate_total = 0.0;
+            let mut worst_regression_pct: f64 = 0.0;
 
-            let improvement_pct = if baseline_cost > 0.0 {
-                (baseline_cost - candidate_cost) / baseline_cost * 100.0
-            } else {
-                0.0
-            };
-            worst_regression_pct = worst_regression_pct.max(-improvement_pct);
-            per_query.push(QueryDelta {
-                fingerprint: q.fingerprint.clone(),
-                label: q.label.clone(),
-                weight: q.weight,
-                baseline_cost,
-                candidate_cost,
-                improvement_pct,
-            });
+            for q in &self.workload {
+                let baseline_cost = *self.baseline.get(&q.fingerprint).unwrap_or(&0.0);
+                let candidate_cost = plan_total_cost(&mut conn, &q.query_text).await?;
+                candidate_total += candidate_cost * q.weight;
+
+                let improvement_pct = if baseline_cost > 0.0 {
+                    (baseline_cost - candidate_cost) / baseline_cost * 100.0
+                } else {
+                    0.0
+                };
+                worst_regression_pct = worst_regression_pct.max(-improvement_pct);
+                per_query.push(QueryDelta {
+                    fingerprint: q.fingerprint.clone(),
+                    label: q.label.clone(),
+                    weight: q.weight,
+                    baseline_cost,
+                    candidate_cost,
+                    improvement_pct,
+                });
+            }
+            Ok((
+                storage_bytes,
+                per_query,
+                candidate_total,
+                worst_regression_pct,
+            ))
         }
+        .await;
 
-        hypopg_reset(&mut conn).await?;
+        let reset = hypopg_reset(&mut conn).await;
+        let (storage_bytes, per_query, candidate_total, worst_regression_pct) = computed?;
+        reset?;
 
         let predicted_improvement_pct = if self.baseline_total > 0.0 {
             (self.baseline_total - candidate_total) / self.baseline_total * 100.0

@@ -159,6 +159,18 @@ async fn end_to_end_evolution_cycle() {
         .unwrap()
         .contains("DROP INDEX"));
 
+    // --- The audit log is genuinely append-only (migration 0002 trigger) ---
+    let hid = history[0].id;
+    let tamper =
+        sqlx::query("UPDATE pistol.evolution_history SET rationale = 'tampered' WHERE id = $1")
+            .bind(hid)
+            .execute(&pool)
+            .await;
+    assert!(
+        tamper.is_err(),
+        "tampering with the audit log must be rejected"
+    );
+
     // --- Measured gate auto-rolls-back when the bar can't be met ---
     // An impossibly high improvement bar forces the in-place trial to roll back
     // whichever candidate it picks.

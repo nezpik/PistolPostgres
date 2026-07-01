@@ -10,6 +10,18 @@ const SCHEMA_SQL: &str = include_str!("../demo/schema.sql");
 /// Create the demo schema (drops any previous demo tables).
 pub async fn schema(pool: &PgPool) -> anyhow::Result<()> {
     sqlx::raw_sql(SCHEMA_SQL).execute(pool).await?;
+    // Dropping/recreating the demo tables removes any pistol-managed indexes, so
+    // clear the saved genome too — otherwise status/proposer would treat dropped
+    // indexes as still active. Guarded so it works before `init` has run.
+    sqlx::raw_sql(
+        "DO $$ BEGIN
+            IF to_regclass('pistol.current_genome') IS NOT NULL THEN
+                TRUNCATE pistol.current_genome;
+            END IF;
+         END $$;",
+    )
+    .execute(pool)
+    .await?;
     println!("✓ demo schema created (public.*, primary keys only)");
     Ok(())
 }

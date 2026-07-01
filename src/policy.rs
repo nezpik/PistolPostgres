@@ -53,6 +53,15 @@ pub fn apply_overrides(mut cfg: PolicyConfig, overrides: &HashMap<String, Value>
             .filter_map(|x| x.as_str().map(String::from))
             .collect();
     }
+    if let Some(v) = overrides
+        .get("protected_schemas")
+        .and_then(|v| v.as_array())
+    {
+        cfg.protected_schemas = v
+            .iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect();
+    }
     cfg
 }
 

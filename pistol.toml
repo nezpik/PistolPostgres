@@ -7,8 +7,9 @@ database_url = "postgres://pistol:pistol@127.0.0.1:55432/pistol"
 
 [evolution]
 # Seed for the stochastic/evolutionary search.
-#   - Set an integer  -> fully reproducible proposals (used by tests & demos).
-#   - Set to 0/absent -> seed from OS entropy (real exploration in production).
+#   - Set a non-zero integer -> fully reproducible proposals (tests & demos).
+#   - Set to 0                -> seed from OS entropy (real exploration in prod).
+#   - Omit the field entirely -> defaults to 42 (deterministic).
 # This is the crux of "non-deterministic yet reliable": randomness is
 # reproducible on demand, never uncontrolled.
 seed = 42

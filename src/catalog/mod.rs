@@ -102,7 +102,11 @@ pub async fn load_current_genome(pool: &PgPool) -> anyhow::Result<Genome> {
     match row {
         Some(r) => {
             let v: Value = r.get("active_indexes");
-            let indexes: Vec<IndexSpec> = serde_json::from_value(v).unwrap_or_default();
+            // Propagate corruption instead of masking it as an empty genome,
+            // which would otherwise drive duplicate proposals / wrong policy.
+            let indexes: Vec<IndexSpec> = serde_json::from_value(v).map_err(|e| {
+                anyhow::anyhow!("corrupt pistol.current_genome.active_indexes: {e}")
+            })?;
             Ok(Genome { indexes })
         }
         None => Ok(Genome::default()),
@@ -158,7 +162,7 @@ pub async fn set_proposal_decision(
     evaluation_results: &Value,
     policy_decision: &Value,
 ) -> anyhow::Result<()> {
-    sqlx::query(
+    let res = sqlx::query(
         "UPDATE pistol.proposals
             SET status = $2, evaluation_results = $3, policy_decision = $4, updated_at = now()
           WHERE id = $1",
@@ -169,7 +173,18 @@ pub async fn set_proposal_decision(
     .bind(policy_decision)
     .execute(pool)
     .await?;
-    Ok(())
+    expect_one(res, "set_proposal_decision")
+}
+
+/// Return an error unless exactly one row was updated — a missing target row
+/// means provenance would silently drift out of sync.
+fn expect_one(result: sqlx::postgres::PgQueryResult, what: &str) -> anyhow::Result<()> {
+    match result.rows_affected() {
+        1 => Ok(()),
+        n => Err(anyhow::anyhow!(
+            "{what}: expected to update 1 row, updated {n}"
+        )),
+    }
 }
 
 pub async fn link_proposal_history(
@@ -178,7 +193,7 @@ pub async fn link_proposal_history(
     history_id: i64,
     status: &str,
 ) -> anyhow::Result<()> {
-    sqlx::query(
+    let res = sqlx::query(
         "UPDATE pistol.proposals
             SET status = $2, applied_history_id = $3, updated_at = now()
           WHERE id = $1",
@@ -188,7 +203,7 @@ pub async fn link_proposal_history(
     .bind(history_id)
     .execute(pool)
     .await?;
-    Ok(())
+    expect_one(res, "link_proposal_history")
 }
 
 // --------------------------------------------------------------------------
@@ -239,7 +254,7 @@ pub async fn mark_history_rolledback(
     id: i64,
     actual_impact: &Value,
 ) -> anyhow::Result<()> {
-    sqlx::query(
+    let res = sqlx::query(
         "UPDATE pistol.evolution_history
             SET status = 'rolled_back', actual_impact = $2
           WHERE id = $1",
@@ -248,7 +263,7 @@ pub async fn mark_history_rolledback(
     .bind(actual_impact)
     .execute(pool)
     .await?;
-    Ok(())
+    expect_one(res, "mark_history_rolledback")
 }
 
 #[derive(Debug)]

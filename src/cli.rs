@@ -102,13 +102,18 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Demo(cmd) => match cmd {
             DemoCmd::All(a) => {
+                // load() writes to pistol.workload, so the catalog must exist.
+                db::migrate(&pool).await?;
                 demo::schema(&pool).await?;
                 demo::seed(&pool).await?;
                 demo::load(&pool, a.iterations).await?;
             }
             DemoCmd::Schema => demo::schema(&pool).await?,
             DemoCmd::Seed => demo::seed(&pool).await?,
-            DemoCmd::Load(a) => demo::load(&pool, a.iterations).await?,
+            DemoCmd::Load(a) => {
+                db::migrate(&pool).await?;
+                demo::load(&pool, a.iterations).await?;
+            }
         },
         Command::Collect => collect(&pool).await?,
         Command::Propose => propose(&pool, &config).await?,
@@ -296,13 +301,14 @@ async fn rollback(pool: &PgPool, id: i64) -> anyhow::Result<()> {
     let impact = serde_json::json!({ "manual_rollback": true });
     catalog::mark_history_rolledback(pool, id, &impact).await?;
 
-    // Remove the index from the active genome if present.
+    // Remove exactly the rolled-back index from the active genome. Compare on
+    // the generated rollback DDL (exact identity) rather than substring-matching
+    // the raw DDL, which could drop unrelated entries whose names overlap.
     let genome = catalog::load_current_genome(pool).await?;
-    let target = h.ddl_executed.unwrap_or_default();
     let kept: Vec<_> = genome
         .indexes
         .into_iter()
-        .filter(|i| !target.contains(&i.index_name()))
+        .filter(|i| i.drop_ddl(true) != ddl)
         .collect();
     catalog::save_current_genome(
         pool,

@@ -107,8 +107,15 @@ impl IndexSpec {
         let short = format!("{:06x}", (hasher.finish() as u32) & 0x00ff_ffff);
         let raw = format!("pi_{}_{}", self.table, cols);
         let max_body = 63 - 1 - short.len();
+        // Truncate on a char boundary so non-ASCII identifiers never panic.
         let body = if raw.len() > max_body {
-            &raw[..max_body]
+            let end = raw
+                .char_indices()
+                .map(|(i, ch)| i + ch.len_utf8())
+                .take_while(|&i| i <= max_body)
+                .last()
+                .unwrap_or(0);
+            &raw[..end]
         } else {
             raw.as_str()
         };
@@ -157,13 +164,13 @@ impl IndexSpec {
     /// versa) on the same table — i.e. one index makes the other largely
     /// redundant. Used to penalize redundant proposals.
     pub fn overlaps(&self, other: &IndexSpec) -> bool {
-        if self.schema != other.schema || self.table != other.table {
+        if self.schema != other.schema || self.table != other.table || self.method != other.method {
             return false;
         }
-        let a: Vec<&str> = self.columns.iter().map(|c| c.name.as_str()).collect();
-        let b: Vec<&str> = other.columns.iter().map(|c| c.name.as_str()).collect();
-        let n = a.len().min(b.len());
-        a[..n] == b[..n]
+        // Compare name AND sort direction: (a, b) does not cover (a, b DESC),
+        // which the proposer needs for ORDER BY support.
+        let n = self.columns.len().min(other.columns.len());
+        self.columns[..n] == other.columns[..n]
     }
 }
 
@@ -250,6 +257,17 @@ mod tests {
         // Different table never overlaps.
         let other = IndexSpec::new("activity_events", vec![IndexColumn::asc("student_id")]);
         assert!(!a.overlaps(&other));
+        // Sort direction is part of identity: (id, created_at) does NOT cover
+        // (id, created_at DESC), so they are not redundant.
+        let asc = spec(vec![
+            IndexColumn::asc("student_id"),
+            IndexColumn::asc("created_at"),
+        ]);
+        let desc = spec(vec![
+            IndexColumn::asc("student_id"),
+            IndexColumn::desc("created_at"),
+        ]);
+        assert!(!asc.overlaps(&desc));
     }
 
     #[test]
