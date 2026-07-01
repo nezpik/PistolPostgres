@@ -104,6 +104,7 @@ These subcommands double as the "Hermes tool" seam from the blueprint (§6).
 |---|---|
 | `pistol init` | Create the `pistol.*` catalog (runs migrations). |
 | `pistol demo all\|schema\|seed\|load` | Build the demo edtech DB & workload. |
+| `pistol capture [--min-calls N --limit N]` | Auto-populate the workload from `pg_stat_statements` (self-driving). |
 | `pistol collect` | Take a telemetry snapshot; show derived index candidates. |
 | `pistol propose` | Run the evolutionary search; print ranked proposals (no changes). |
 | `pistol run [--watch --interval N]` | Run the full cycle once, or continuously. |
@@ -114,6 +115,24 @@ These subcommands double as the "Hermes tool" seam from the blueprint (§6).
 Config lives in [`pistol.toml`](./pistol.toml) (connection, evolution
 parameters, fitness weights, and policy gates). Key overrides: `PISTOL_DATABASE_URL`,
 `PISTOL_SEED`, `PISTOL_AUTONOMY`.
+
+### Self-driving on your own database
+
+No hand-written workload required — point it at a database with
+`pg_stat_statements` and let it learn the real workload:
+
+```bash
+pistol init
+pistol capture     # pulls the hot queries from pg_stat_statements into pistol.workload
+pistol run         # proposes + evaluates + applies against that real workload
+```
+
+Captured queries are *normalized* (`… WHERE x = $1`), so the proposal/evaluation
+tier plans them with `EXPLAIN (GENERIC_PLAN)` (hypopg's hypothetical indexes are
+still considered). The measured Tier-2 gate applies to **concrete** queries; a
+purely parameterized workload is validated on the estimated generic-plan cost
+(restoring measured validation there — via concrete parameter sampling — is the
+next step). History labels each change `measured` or `predicted` accordingly.
 
 ---
 

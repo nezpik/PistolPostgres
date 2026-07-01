@@ -185,6 +185,7 @@ async fn end_to_end_evolution_cycle() {
         query_text: "DELETE FROM public.ro_probe".into(),
         weight: 1.0,
         label: None,
+        parameterized: false,
     }];
     let res = measure::measure(&pool, &mutating, 1).await;
     assert!(
@@ -212,6 +213,30 @@ async fn end_to_end_evolution_cycle() {
         indexes_before,
         count_public_indexes(&pool).await,
         "a rolled-back trial must leave no index behind"
+    );
+
+    // --- Automatic capture: self-drive from pg_stat_statements ---
+    // The demo workload ran real queries, so pg_stat_statements has them.
+    let n = telemetry::capture_workload(&pool, 1, 100)
+        .await
+        .expect("capture");
+    assert!(
+        n > 0,
+        "expected to capture hot queries from pg_stat_statements"
+    );
+    let all = catalog::fetch_workload(&pool).await.unwrap();
+    assert!(
+        all.iter().any(|w| w.parameterized),
+        "captured queries should be parameterized (normalized)"
+    );
+    // Parameterized (normalized) queries still yield index candidates, so the
+    // proposal pipeline is fully self-driving.
+    let caps = telemetry::candidates_validated(&pool, &all)
+        .await
+        .expect("candidates from captured workload");
+    assert!(
+        !caps.is_empty(),
+        "captured parameterized queries should still yield candidates"
     );
 }
 

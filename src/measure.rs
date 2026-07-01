@@ -166,6 +166,7 @@ mod tests {
             query_text: String::new(),
             weight: w,
             label: None,
+            parameterized: false,
         }
     }
 

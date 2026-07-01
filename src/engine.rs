@@ -259,11 +259,10 @@ pub async fn run_once(pool: &PgPool, config: &Config) -> anyhow::Result<CycleRep
         });
     }
 
-    let measured = trial
-        .impact
-        .as_ref()
-        .map(|m| format!("{:+.1}% measured latency", m.improvement_pct))
-        .unwrap_or_else(|| "applied (measured gate disabled)".into());
+    let measured = match &trial.impact {
+        Some(m) => format!("{:+.1}% measured latency", m.improvement_pct),
+        None => format!("kept ({})", trial.measured_on),
+    };
     println!(
         "✓ applied {} (history #{}) — {}",
         best.index.index_name(),
@@ -308,6 +307,26 @@ async fn measured_trial(
         });
     }
 
+    // Only concrete queries can be timed with EXPLAIN (ANALYZE); parameterized
+    // (captured) queries were already gated on estimated GENERIC_PLAN cost.
+    let concrete: Vec<catalog::WorkloadQuery> = workload
+        .iter()
+        .filter(|w| !w.parameterized)
+        .cloned()
+        .collect();
+    if concrete.is_empty() {
+        // Parameterized-only workload (e.g. fully auto-captured): apply on the
+        // estimated gate that already passed. Restoring measured validation here
+        // (via concrete parameter sampling) is the next follow-on.
+        apply::build_index_online(pool, index).await?;
+        return Ok(Trial {
+            impact: None,
+            kept: true,
+            measured_on: "estimated-only",
+            note: "parameterized-only workload; validated by estimated generic-plan cost".into(),
+        });
+    }
+
     let shadow = if mcfg.shadow_database_url.is_empty() {
         None
     } else {
@@ -324,11 +343,11 @@ async fn measured_trial(
         mcfg.samples
     );
 
-    let baseline = measure::measure(target, workload, mcfg.samples).await?;
+    let baseline = measure::measure(target, &concrete, mcfg.samples).await?;
     apply::build_index_online(target, index).await?;
     // The trial index now exists on `target`; ensure it is removed on any error
     // path below, not just the normal keep/reject branches.
-    let candidate = match measure::measure(target, workload, mcfg.samples).await {
+    let candidate = match measure::measure(target, &concrete, mcfg.samples).await {
         Ok(c) => c,
         Err(e) => {
             let _ = apply::drop_index_online(target, index).await;
@@ -338,7 +357,7 @@ async fn measured_trial(
     let impact = measure::summarize(
         &baseline,
         &candidate,
-        workload,
+        &concrete,
         mcfg.samples,
         mcfg.noise_floor_ms,
     );

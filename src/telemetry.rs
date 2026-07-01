@@ -135,6 +135,95 @@ async fn query_stats(pool: &PgPool) -> anyhow::Result<Value> {
 }
 
 // --------------------------------------------------------------------------
+// Automatic workload capture (self-driving)
+// --------------------------------------------------------------------------
+
+/// Populate `pistol.workload` from `pg_stat_statements` — the real hot queries,
+/// ranked by total execution time. Stores the normalized (parameterized) text,
+/// which is evaluated via `EXPLAIN (GENERIC_PLAN)`. Only read queries that (a)
+/// don't touch pistol/system objects and (b) yield at least one index candidate
+/// are kept. Returns the number captured.
+pub async fn capture_workload(pool: &PgPool, min_calls: i64, limit: i64) -> anyhow::Result<usize> {
+    let rows = match sqlx::query(
+        "SELECT queryid, query, calls
+           FROM pg_stat_statements
+          WHERE calls >= $1
+          ORDER BY total_exec_time DESC
+          LIMIT $2",
+    )
+    .bind(min_calls)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("42P01") => {
+            anyhow::bail!("pg_stat_statements not available; cannot capture workload");
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let mut captured = 0usize;
+    for r in rows {
+        let queryid: Option<i64> = r.get("queryid");
+        let query: String = r.get("query");
+        let calls: i64 = r.get("calls");
+        if !is_capturable(&query) {
+            continue;
+        }
+        // Keep only queries that actually yield an indexable candidate.
+        let probe = WorkloadQuery {
+            fingerprint: "probe".into(),
+            query_text: query.clone(),
+            weight: 1.0,
+            label: None,
+            parameterized: query.contains('$'),
+        };
+        if candidates_from_workload(std::slice::from_ref(&probe)).is_empty() {
+            continue;
+        }
+        let fingerprint = match queryid {
+            Some(id) => format!("pgss-{id}"),
+            None => format!("pgss-{:x}", stable_hash(&query)),
+        };
+        let wq = WorkloadQuery {
+            fingerprint,
+            label: Some(query.chars().take(60).collect()),
+            parameterized: query.contains('$'),
+            query_text: query,
+            weight: calls as f64,
+        };
+        catalog::upsert_workload(pool, &wq).await?;
+        captured += 1;
+    }
+    Ok(captured)
+}
+
+/// Cheap textual pre-filter for capture: read statements only, and never our own
+/// telemetry/system queries.
+fn is_capturable(q: &str) -> bool {
+    let up = q.trim_start().to_uppercase();
+    if !(up.starts_with("SELECT") || up.starts_with("WITH")) || up.contains("EXPLAIN") {
+        return false;
+    }
+    let low = q.to_lowercase();
+    !(low.contains("pg_stat_statements")
+        || low.contains("hypopg")
+        || low.contains("pistol.")
+        || low.contains("information_schema")
+        || low.contains("pg_catalog")
+        || low.contains("pg_relation_size")
+        || low.contains("pg_indexes"))
+}
+
+fn stable_hash(s: &str) -> u32 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    (h.finish() as u32) & 0x00ff_ffff
+}
+
+// --------------------------------------------------------------------------
 // Workload-driven candidate extraction
 // --------------------------------------------------------------------------
 
@@ -487,5 +576,48 @@ fn object_name_to_schema_table(name: &sqlparser::ast::ObjectName) -> (String, St
             parts[parts.len() - 2].value.clone(),
             parts[parts.len() - 1].value.clone(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wq(sql: &str) -> WorkloadQuery {
+        WorkloadQuery {
+            fingerprint: "t".into(),
+            query_text: sql.into(),
+            weight: 1.0,
+            label: None,
+            parameterized: sql.contains('$'),
+        }
+    }
+
+    #[test]
+    fn parameterized_query_yields_candidates() {
+        // A normalized (pg_stat_statements-style) query with $N placeholders
+        // must still parse and produce an equality + sort candidate.
+        let w = vec![wq(
+            "SELECT id FROM student_progress WHERE student_id = $1 ORDER BY created_at DESC LIMIT $2",
+        )];
+        let cands = candidates_from_workload(&w);
+        let sp = cands
+            .iter()
+            .find(|c| c.table == "student_progress")
+            .expect("candidate for student_progress");
+        assert!(sp.eq_columns.iter().any(|c| c == "student_id"));
+        assert!(sp
+            .sort_columns
+            .iter()
+            .any(|(c, desc)| c == "created_at" && *desc));
+    }
+
+    #[test]
+    fn is_capturable_filters_system_and_writes() {
+        assert!(is_capturable("SELECT a FROM t WHERE x = $1"));
+        assert!(!is_capturable("EXPLAIN (ANALYZE) SELECT 1"));
+        assert!(!is_capturable("UPDATE t SET x = 1"));
+        assert!(!is_capturable("SELECT * FROM pg_catalog.pg_class"));
+        assert!(!is_capturable("SELECT * FROM pistol.workload"));
     }
 }
