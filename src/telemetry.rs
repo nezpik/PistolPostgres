@@ -168,7 +168,10 @@ pub async fn capture_workload(pool: &PgPool, min_calls: i64, limit: i64) -> anyh
         let queryid: Option<i64> = r.get("queryid");
         let query: String = r.get("query");
         let calls: i64 = r.get("calls");
-        if !is_capturable(&query) {
+        // Cheap textual pre-filter, then a real parse-based read-only guard so a
+        // writable CTE (WITH … AS (DELETE …)) or multi-statement text is never
+        // stored / later executed.
+        if !is_capturable(&query) || !is_read_only_single(&query) {
             continue;
         }
         // Keep only queries that actually yield an indexable candidate.
@@ -184,7 +187,7 @@ pub async fn capture_workload(pool: &PgPool, min_calls: i64, limit: i64) -> anyh
         }
         let fingerprint = match queryid {
             Some(id) => format!("pgss-{id}"),
-            None => format!("pgss-{:x}", stable_hash(&query)),
+            None => format!("pgss-{:016x}", stable_hash(&query)),
         };
         let wq = WorkloadQuery {
             fingerprint,
@@ -216,11 +219,52 @@ fn is_capturable(q: &str) -> bool {
         || low.contains("pg_indexes"))
 }
 
-fn stable_hash(s: &str) -> u32 {
+fn stable_hash(s: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut h);
-    (h.finish() as u32) & 0x00ff_ffff
+    h.finish()
+}
+
+/// True only if `sql` is exactly ONE read-only statement (a `SELECT`/`VALUES`/
+/// `TABLE`/CTE query with no data-modifying CTE). Used to gate the simple-query
+/// (`raw_sql`) EXPLAIN path and workload capture, so a multi-statement or
+/// writable query from the catalog can never be executed.
+pub fn is_read_only_single(sql: &str) -> bool {
+    let dialect = PostgreSqlDialect {};
+    let stmts = match Parser::parse_sql(&dialect, sql) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    if stmts.len() != 1 {
+        return false;
+    }
+    matches!(&stmts[0], Statement::Query(q) if query_is_read_only(q))
+}
+
+fn query_is_read_only(q: &Query) -> bool {
+    if let Some(with) = &q.with {
+        if with
+            .cte_tables
+            .iter()
+            .any(|cte| !query_is_read_only(&cte.query))
+        {
+            return false;
+        }
+    }
+    set_expr_read_only(q.body.as_ref())
+}
+
+fn set_expr_read_only(se: &SetExpr) -> bool {
+    match se {
+        SetExpr::Select(_) | SetExpr::Values(_) | SetExpr::Table(_) => true,
+        SetExpr::Query(q) => query_is_read_only(q),
+        SetExpr::SetOperation { left, right, .. } => {
+            set_expr_read_only(left) && set_expr_read_only(right)
+        }
+        // Insert/Update (data-modifying CTEs) and anything unrecognized: reject.
+        _ => false,
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -875,6 +919,21 @@ mod tests {
         subs.insert(10u32, "'b'".to_string());
         let out = substitute_placeholders("x = $1 AND y = $10", &subs);
         assert_eq!(out, "x = 'a' AND y = 'b'");
+    }
+
+    #[test]
+    fn read_only_guard_rejects_multi_statement_and_writable_ctes() {
+        assert!(is_read_only_single("SELECT a FROM t WHERE x = $1"));
+        assert!(is_read_only_single(
+            "WITH r AS (SELECT id FROM t WHERE x = 1) SELECT * FROM r"
+        ));
+        // Multiple statements (the injection vector for the simple protocol).
+        assert!(!is_read_only_single("SELECT 1; DROP TABLE t"));
+        // Data-modifying CTE wrapped in a SELECT.
+        assert!(!is_read_only_single(
+            "WITH d AS (DELETE FROM t RETURNING id) SELECT * FROM d"
+        ));
+        assert!(!is_read_only_single("UPDATE t SET x = 1"));
     }
 
     #[test]

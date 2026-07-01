@@ -173,6 +173,11 @@ pub async fn plan_total_cost(
     // errors that 0 were supplied), whereas GENERIC_PLAN needs them as
     // placeholders. `raw_sql` uses the simple protocol.
     let row = if parameterized {
+        // The simple protocol executes every `;`-separated statement, so refuse
+        // anything that isn't a single read-only query before running it.
+        if !crate::telemetry::is_read_only_single(sql) {
+            anyhow::bail!("refusing to plan a non-read-only or multi-statement query");
+        }
         sqlx::raw_sql(&explain)
             .fetch_all(&mut *conn)
             .await?

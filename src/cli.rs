@@ -72,10 +72,10 @@ pub struct DemoAllArgs {
 pub struct CaptureArgs {
     /// Only capture queries called at least this many times.
     #[arg(long, default_value_t = 5)]
-    pub min_calls: i64,
+    pub min_calls: u32,
     /// Max number of (hottest) queries to capture.
-    #[arg(long, default_value_t = 50)]
-    pub limit: i64,
+    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..))]
+    pub limit: u32,
 }
 
 #[derive(Args)]
@@ -139,7 +139,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
 }
 
 async fn capture(pool: &PgPool, args: CaptureArgs) -> anyhow::Result<()> {
-    let n = telemetry::capture_workload(pool, args.min_calls, args.limit).await?;
+    let n = telemetry::capture_workload(pool, args.min_calls as i64, args.limit as i64).await?;
     println!(
         "✓ captured {n} workload quer{} from pg_stat_statements (min_calls={}, limit={})",
         if n == 1 { "y" } else { "ies" },
