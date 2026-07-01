@@ -240,14 +240,18 @@ async fn end_to_end_evolution_cycle() {
     );
 
     // --- Concrete-parameter sampling makes a captured query measurable ---
-    let param = all
-        .iter()
-        .find(|w| w.parameterized)
-        .expect("a captured parameterized query");
-    let concrete = telemetry::concretize(&pool, param)
-        .await
-        .expect("concretize")
-        .expect("captured predicate query should be concretizable");
+    // Scan the parameterized captures for one that concretizes: concretize() may
+    // legitimately return None for some shapes, and fetch_workload order isn't
+    // guaranteed, so we must not assume the first parameterized entry works.
+    let mut concretized = None;
+    for w in all.iter().filter(|w| w.parameterized) {
+        if let Some(sql) = telemetry::concretize(&pool, w).await.expect("concretize") {
+            concretized = Some((w.clone(), sql));
+            break;
+        }
+    }
+    let (param, concrete) =
+        concretized.expect("at least one captured parameterized query should concretize");
     assert!(
         !concrete.contains('$'),
         "concretized SQL must not contain placeholders: {concrete}"
@@ -256,7 +260,7 @@ async fn end_to_end_evolution_cycle() {
     let one = vec![catalog::WorkloadQuery {
         query_text: concrete,
         parameterized: false,
-        ..param.clone()
+        ..param
     }];
     let timed = measure::measure(&pool, &one, 1)
         .await
