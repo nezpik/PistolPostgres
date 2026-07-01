@@ -29,6 +29,24 @@ w_storage = 0.15
 w_write_amp = 0.25
 w_redundancy = 0.5
 
+[measure]
+# Tier-2 measured gate. hypopg (Tier 1) cheaply pre-filters candidates on
+# ESTIMATED cost; the winner is then validated by REAL EXPLAIN (ANALYZE) latency
+# before it is kept. This is what makes autonomy trustworthy.
+enabled = true
+samples = 5                        # measured runs per query (best-of-N; plus a discarded warm-up)
+min_measured_improvement_pct = 10.0
+# In-place trials are cache-noisy, so the default only catches egregious
+# (plan-flip) regressions. Point shadow_database_url at a quiet replica to
+# tighten this toward a few percent.
+max_measured_regression_pct = 25.0
+# Queries faster than this (ms) are too small to time reliably and cannot veto
+# a change — prevents false rollbacks from sub-millisecond timing jitter.
+noise_floor_ms = 1.0
+# Optional replica/branch to measure against for zero production impact.
+# Empty => in-place trial on the primary with guaranteed auto-rollback.
+shadow_database_url = ""
+
 [policy]
 # Declarative safety gates (blueprint §4.4 / §5).
 autonomy_level = "auto_safe"          # advisory | auto_safe | auto_broad

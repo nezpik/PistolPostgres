@@ -5,9 +5,10 @@
 //! Run with:
 //!   PISTOL_TEST_DATABASE_URL=postgres://pistol@127.0.0.1:55432/pistol cargo test --test integration -- --nocapture
 
-use pistol::config::{Config, Evolution, Fitness, PolicyConfig};
+use pistol::config::{Config, Evolution, Fitness, Measure, PolicyConfig};
 use pistol::evaluator::Evaluator;
 use pistol::genome::{Genome, IndexColumn, IndexSpec};
+use pistol::measure;
 use pistol::proposer::evolutionary::EvolutionaryProposer;
 use pistol::proposer::ProposalContext;
 use pistol::{apply, catalog, db, demo, engine, telemetry};
@@ -24,6 +25,7 @@ fn test_config(url: &str) -> Config {
             autonomy_level: "auto_safe".into(),
             ..PolicyConfig::default()
         },
+        measure: Measure::default(),
     }
 }
 
@@ -99,37 +101,85 @@ async fn end_to_end_evolution_cycle() {
         "same seed must yield same top proposal"
     );
 
-    // --- A full cycle applies an index and records provenance ---
+    // --- Direct measurement: a real index beats a seq scan (robust signal) ---
+    // student_dashboard scans 150k rows and sorts without an index; an index on
+    // (student_id, created_at) turns it into a tiny index scan — a large,
+    // noise-proof latency win.
+    let spec = IndexSpec::new(
+        "student_progress",
+        vec![
+            IndexColumn::asc("student_id"),
+            IndexColumn::desc("created_at"),
+        ],
+    );
+    let base = measure::measure(&pool, &tele.workload, 2)
+        .await
+        .expect("baseline");
+    apply::build_index_online(&pool, &spec)
+        .await
+        .expect("build");
+    let cand = measure::measure(&pool, &tele.workload, 2)
+        .await
+        .expect("candidate");
+    let impact = measure::summarize(
+        &base,
+        &cand,
+        &tele.workload,
+        2,
+        config.measure.noise_floor_ms,
+    );
+    let dash = impact
+        .per_query
+        .iter()
+        .find(|t| t.fingerprint == "student_dashboard")
+        .expect("timing for student_dashboard");
+    assert!(
+        dash.improvement_pct > 0.0,
+        "indexed dashboard query should be measurably faster (got {:.1}%)",
+        dash.improvement_pct
+    );
+    apply::drop_index_online(&pool, &spec).await.expect("drop");
+
+    // --- A full cycle applies an index validated by MEASURED latency ---
     let report = engine::run_once(&pool, &config).await.expect("run_once");
     assert!(
         report.applied.is_some(),
-        "first cycle should apply an index"
+        "first cycle should apply a measured-good index"
     );
     let history = catalog::fetch_history(&pool, 10).await.expect("history");
     assert!(!history.is_empty());
     assert_eq!(history[0].status, "applied");
+    // Provenance carries both the prediction and the real measurement.
+    let ai = history[0].actual_impact.as_ref().unwrap();
+    assert!(ai.get("measured").is_some(), "measured impact recorded");
+    assert!(ai.get("predicted_improvement_pct").is_some());
     assert!(history[0]
         .rollback_ddl
         .as_ref()
         .unwrap()
         .contains("DROP INDEX"));
 
-    // --- Post-apply monitor auto-rolls-back on regression ---
-    // A negative regression gate forces rollback of any real change, exercising
-    // the monitor path deterministically.
-    let spec = IndexSpec::new("enrollments", vec![IndexColumn::asc("student_id")]);
-    let eval = evaluator.evaluate(&spec).await.expect("evaluate spec");
-    let outcome = apply::apply_and_monitor(&pool, &spec, &eval, &tele.workload, -1.0)
+    // --- Measured gate auto-rolls-back when the bar can't be met ---
+    // An impossibly high improvement bar forces the in-place trial to roll back
+    // whichever candidate it picks.
+    let indexes_before = count_public_indexes(&pool).await;
+    let mut strict = config.clone();
+    strict.measure.min_measured_improvement_pct = 99.999;
+    let trial = engine::run_once(&pool, &strict).await.expect("strict run");
+    assert!(
+        trial.applied.is_none() && trial.rolled_back,
+        "unmeetable measured bar must roll back, not keep"
+    );
+    assert_eq!(
+        indexes_before,
+        count_public_indexes(&pool).await,
+        "a rolled-back trial must leave no index behind"
+    );
+}
+
+async fn count_public_indexes(pool: &sqlx::PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM pg_indexes WHERE schemaname = 'public'")
+        .fetch_one(pool)
         .await
-        .expect("apply_and_monitor");
-    assert!(
-        outcome.rolled_back,
-        "negative gate must trigger auto-rollback"
-    );
-    assert!(
-        !apply::index_exists(&pool, "public", &spec.index_name())
-            .await
-            .unwrap(),
-        "rolled-back index must not exist"
-    );
+        .unwrap()
 }

@@ -12,6 +12,47 @@ pub struct Config {
     pub fitness: Fitness,
     #[serde(default)]
     pub policy: PolicyConfig,
+    #[serde(default)]
+    pub measure: Measure,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Measure {
+    /// Tier-2 measured gate. When true, the top candidate is validated by real
+    /// `EXPLAIN (ANALYZE)` latency (not just hypopg's estimated cost) before it
+    /// is kept.
+    pub enabled: bool,
+    /// Measured samples per query (a warm-up run is taken and discarded on top).
+    pub samples: usize,
+    /// Keep the change only if measured weighted latency drops at least this %.
+    pub min_measured_improvement_pct: f64,
+    /// Roll back if any query's measured latency worsens beyond this %.
+    pub max_measured_regression_pct: f64,
+    /// Queries whose baseline is below this many milliseconds are too fast to
+    /// time reliably and cannot veto a change (noise-floor guard).
+    pub noise_floor_ms: f64,
+    /// Optional replica/branch to measure against for ZERO production impact.
+    /// If empty, the trial runs in-place on the primary and auto-rolls-back on
+    /// a failed measured gate.
+    pub shadow_database_url: String,
+}
+
+impl Default for Measure {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            samples: 5,
+            min_measured_improvement_pct: 10.0,
+            // In-place trials perturb the buffer cache (the index build evicts
+            // pages), so unrelated queries can read a bit slower in the post-
+            // build window. A tolerant default catches only egregious (plan-
+            // flip) regressions; measure on a shadow replica to tighten this.
+            max_measured_regression_pct: 25.0,
+            noise_floor_ms: 1.0,
+            shadow_database_url: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -106,6 +147,7 @@ impl Config {
                 evolution: Evolution::default(),
                 fitness: Fitness::default(),
                 policy: PolicyConfig::default(),
+                measure: Measure::default(),
             }
         };
 
@@ -119,6 +161,9 @@ impl Config {
         }
         if let Ok(level) = std::env::var("PISTOL_AUTONOMY") {
             cfg.policy.autonomy_level = level;
+        }
+        if let Ok(url) = std::env::var("PISTOL_SHADOW_DATABASE_URL") {
+            cfg.measure.shadow_database_url = url;
         }
 
         if cfg.database_url.is_empty() {

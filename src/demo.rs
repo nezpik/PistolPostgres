@@ -23,7 +23,7 @@ pub async fn seed(pool: &PgPool) -> anyhow::Result<()> {
 
     INSERT INTO public.students
       SELECT g, 1+(random()*49)::int, 'Student '||g, 1+(random()*11)::int,
-             now() - (random()*400||' days')::interval
+             now() - ((random()*400)::int||' days')::interval
       FROM generate_series(1,5000) g;
 
     INSERT INTO public.classes
@@ -34,18 +34,18 @@ pub async fn seed(pool: &PgPool) -> anyhow::Result<()> {
 
     INSERT INTO public.enrollments
       SELECT g, 1+(random()*4999)::int, 1+(random()*499)::int,
-             now() - (random()*300||' days')::interval,
+             now() - ((random()*300)::int||' days')::interval,
              (ARRAY['active','active','active','dropped','completed'])[1+(g%5)]
       FROM generate_series(1,30000) g;
 
     INSERT INTO public.assignments
       SELECT g, 1+(random()*499)::int, 'Assignment '||g,
-             now() + (random()*30||' days')::interval
+             now() + ((random()*30)::int||' days')::interval
       FROM generate_series(1,5000) g;
 
     INSERT INTO public.submissions
       SELECT g, 1+(random()*4999)::int, 1+(random()*4999)::int,
-             now() - (random()*200||' days')::interval,
+             now() - ((random()*200)::int||' days')::interval,
              (random() < 0.6), (random()*100)::int
       FROM generate_series(1,100000) g;
 
@@ -53,13 +53,13 @@ pub async fn seed(pool: &PgPool) -> anyhow::Result<()> {
       SELECT g, 1+(random()*4999)::int, 1+(random()*499)::int, 1+(random()*49)::int,
              (ARRAY['in_progress','completed','not_started'])[1+(g%3)],
              (random()*100)::int,
-             now() - (random()*365||' days')::interval
+             now() - ((random()*365)::int||' days')::interval
       FROM generate_series(1,150000) g;
 
     INSERT INTO public.activity_events
       SELECT g, 1+(random()*4999)::int,
              (ARRAY['login','view','submit','comment'])[1+(g%4)],
-             now() - (random()*365||' days')::interval
+             now() - ((random()*365)::int||' days')::interval
       FROM generate_series(1,200000) g;
 
     ANALYZE;

@@ -11,6 +11,7 @@ pub mod demo;
 pub mod engine;
 pub mod evaluator;
 pub mod genome;
+pub mod measure;
 pub mod policy;
 pub mod proposer;
 pub mod telemetry;
