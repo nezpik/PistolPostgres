@@ -307,26 +307,6 @@ async fn measured_trial(
         });
     }
 
-    // Only concrete queries can be timed with EXPLAIN (ANALYZE); parameterized
-    // (captured) queries were already gated on estimated GENERIC_PLAN cost.
-    let concrete: Vec<catalog::WorkloadQuery> = workload
-        .iter()
-        .filter(|w| !w.parameterized)
-        .cloned()
-        .collect();
-    if concrete.is_empty() {
-        // Parameterized-only workload (e.g. fully auto-captured): apply on the
-        // estimated gate that already passed. Restoring measured validation here
-        // (via concrete parameter sampling) is the next follow-on.
-        apply::build_index_online(pool, index).await?;
-        return Ok(Trial {
-            impact: None,
-            kept: true,
-            measured_on: "estimated-only",
-            note: "parameterized-only workload; validated by estimated generic-plan cost".into(),
-        });
-    }
-
     let shadow = if mcfg.shadow_database_url.is_empty() {
         None
     } else {
@@ -338,9 +318,37 @@ async fn measured_trial(
     } else {
         "primary (in-place)"
     };
+
+    // Build the measurable set. Concrete queries are used as-is; parameterized
+    // (captured) queries are concretized by sampling real parameter values, so
+    // the measured gate applies to them too. Whatever can't be concretized is
+    // left to the estimated gate.
+    let mut concrete: Vec<catalog::WorkloadQuery> = Vec::new();
+    for w in workload {
+        if let Some(sql) = telemetry::concretize(target, w).await? {
+            concrete.push(catalog::WorkloadQuery {
+                query_text: sql,
+                parameterized: false,
+                ..w.clone()
+            });
+        }
+    }
+    if concrete.is_empty() {
+        // Nothing measurable (e.g. captured queries we couldn't concretize):
+        // apply on the estimated gate that already passed.
+        apply::build_index_online(pool, index).await?;
+        return Ok(Trial {
+            impact: None,
+            kept: true,
+            measured_on: "estimated-only",
+            note: "no measurable (concretizable) queries; validated by estimated generic-plan cost"
+                .into(),
+        });
+    }
     println!(
-        "▸ measured trial on {where_}: EXPLAIN (ANALYZE) × {} samples…",
-        mcfg.samples
+        "▸ measured trial on {where_}: EXPLAIN (ANALYZE) × {} samples ({} queries)…",
+        mcfg.samples,
+        concrete.len()
     );
 
     let baseline = measure::measure(target, &concrete, mcfg.samples).await?;

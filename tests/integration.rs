@@ -238,6 +238,33 @@ async fn end_to_end_evolution_cycle() {
         !caps.is_empty(),
         "captured parameterized queries should still yield candidates"
     );
+
+    // --- Concrete-parameter sampling makes a captured query measurable ---
+    let param = all
+        .iter()
+        .find(|w| w.parameterized)
+        .expect("a captured parameterized query");
+    let concrete = telemetry::concretize(&pool, param)
+        .await
+        .expect("concretize")
+        .expect("captured predicate query should be concretizable");
+    assert!(
+        !concrete.contains('$'),
+        "concretized SQL must not contain placeholders: {concrete}"
+    );
+    // The concretized query is now timeable with EXPLAIN (ANALYZE).
+    let one = vec![catalog::WorkloadQuery {
+        query_text: concrete,
+        parameterized: false,
+        ..param.clone()
+    }];
+    let timed = measure::measure(&pool, &one, 1)
+        .await
+        .expect("measure concretized captured query");
+    assert!(
+        timed.values().next().copied().unwrap_or(f64::MAX) < f64::MAX,
+        "concretized captured query should produce a real timing"
+    );
 }
 
 async fn count_public_indexes(pool: &sqlx::PgPool) -> i64 {

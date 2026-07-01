@@ -7,8 +7,8 @@ use std::collections::HashMap;
 
 use serde_json::{json, Value};
 use sqlparser::ast::{
-    Expr, GroupByExpr, Join, JoinConstraint, JoinOperator, Query, Select, SetExpr, Statement,
-    TableFactor, TableWithJoins,
+    Expr, GroupByExpr, Join, JoinConstraint, JoinOperator, Offset, Query, Select, SetExpr,
+    Statement, TableFactor, TableWithJoins, Value as SqlValue,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -221,6 +221,244 @@ fn stable_hash(s: &str) -> u32 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut h);
     (h.finish() as u32) & 0x00ff_ffff
+}
+
+// --------------------------------------------------------------------------
+// Concrete-parameter sampling — make captured (parameterized) queries
+// EXPLAIN (ANALYZE)-able so the measured gate applies to them too.
+// --------------------------------------------------------------------------
+
+/// What a `$N` placeholder binds to.
+#[derive(Debug, Clone)]
+enum ParamBind {
+    Column {
+        schema: String,
+        table: String,
+        column: String,
+    },
+    Limit,
+    Offset,
+}
+
+/// Turn a parameterized query into a concrete, runnable one by substituting each
+/// `$N` with a sampled value (predicate columns) or a constant (LIMIT/OFFSET).
+/// Returns `None` if the query can't be fully concretized (any placeholder we
+/// can't classify, or a column we can't sample) — the caller then keeps it on
+/// the estimated gate. Non-parameterized queries are returned unchanged.
+pub async fn concretize(pool: &PgPool, wq: &WorkloadQuery) -> anyhow::Result<Option<String>> {
+    if !wq.parameterized {
+        return Ok(Some(wq.query_text.clone()));
+    }
+    let binds = match analyze_placeholders(&wq.query_text) {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    let mut subs: HashMap<u32, String> = HashMap::new();
+    for (ord, bind) in &binds {
+        let lit = match bind {
+            ParamBind::Limit => "100".to_string(),
+            ParamBind::Offset => "0".to_string(),
+            ParamBind::Column {
+                schema,
+                table,
+                column,
+            } => match sample_literal(pool, schema, table, column).await {
+                Some(l) => l,
+                None => return Ok(None),
+            },
+        };
+        subs.insert(*ord, lit);
+    }
+    Ok(Some(substitute_placeholders(&wq.query_text, &subs)))
+}
+
+/// Classify every `$N` in the query. Returns `None` unless *all* placeholders
+/// are accounted for (so we never produce SQL that still contains a `$N`).
+fn analyze_placeholders(sql: &str) -> Option<HashMap<u32, ParamBind>> {
+    let dialect = PostgreSqlDialect {};
+    let q = match Parser::parse_sql(&dialect, sql).ok()?.into_iter().next()? {
+        Statement::Query(q) => q,
+        _ => return None,
+    };
+    let mut binds = HashMap::new();
+    classify_query(&q, &mut binds);
+    for ord in placeholder_ordinals(sql) {
+        if !binds.contains_key(&ord) {
+            return None; // an unclassified placeholder — bail
+        }
+    }
+    Some(binds)
+}
+
+fn classify_query(q: &Query, binds: &mut HashMap<u32, ParamBind>) {
+    if let SetExpr::Select(select) = q.body.as_ref() {
+        let aliases = build_alias_map(&select.from);
+        let base = single_base_table(&select.from);
+        if let Some(sel) = &select.selection {
+            classify_expr(sel, &aliases, &base, binds);
+        }
+        for twj in &select.from {
+            for j in &twj.joins {
+                if let Some(e) = join_on(j) {
+                    classify_expr(e, &aliases, &base, binds);
+                }
+            }
+        }
+    }
+    if let Some(limit) = &q.limit {
+        if let Some(ord) = placeholder_ordinal(limit) {
+            binds.insert(ord, ParamBind::Limit);
+        }
+    }
+    if let Some(Offset { value, .. }) = &q.offset {
+        if let Some(ord) = placeholder_ordinal(value) {
+            binds.insert(ord, ParamBind::Offset);
+        }
+    }
+}
+
+fn classify_expr(
+    expr: &Expr,
+    aliases: &HashMap<String, (String, String)>,
+    base: &Option<(String, String)>,
+    binds: &mut HashMap<u32, ParamBind>,
+) {
+    use sqlparser::ast::BinaryOperator as Op;
+    match expr {
+        Expr::BinaryOp { left, op, right } => match op {
+            Op::And | Op::Or => {
+                classify_expr(left, aliases, base, binds);
+                classify_expr(right, aliases, base, binds);
+            }
+            Op::Eq | Op::Gt | Op::Lt | Op::GtEq | Op::LtEq | Op::NotEq => {
+                bind_comparison(left, right, aliases, base, binds);
+            }
+            _ => {}
+        },
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            if let Some(col) = resolve_column(expr, aliases, base) {
+                for side in [low.as_ref(), high.as_ref()] {
+                    if let Some(ord) = placeholder_ordinal(side) {
+                        binds.insert(ord, to_column_bind(&col));
+                    }
+                }
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            if let Some(col) = resolve_column(expr, aliases, base) {
+                for e in list {
+                    if let Some(ord) = placeholder_ordinal(e) {
+                        binds.insert(ord, to_column_bind(&col));
+                    }
+                }
+            }
+        }
+        Expr::Nested(inner) => classify_expr(inner, aliases, base, binds),
+        _ => {}
+    }
+}
+
+/// Bind whichever side of a comparison is a placeholder to the column on the
+/// other side.
+fn bind_comparison(
+    left: &Expr,
+    right: &Expr,
+    aliases: &HashMap<String, (String, String)>,
+    base: &Option<(String, String)>,
+    binds: &mut HashMap<u32, ParamBind>,
+) {
+    if let (Some(col), Some(ord)) = (
+        resolve_column(left, aliases, base),
+        placeholder_ordinal(right),
+    ) {
+        binds.insert(ord, to_column_bind(&col));
+    } else if let (Some(col), Some(ord)) = (
+        resolve_column(right, aliases, base),
+        placeholder_ordinal(left),
+    ) {
+        binds.insert(ord, to_column_bind(&col));
+    }
+}
+
+fn to_column_bind(col: &((String, String), String)) -> ParamBind {
+    ParamBind::Column {
+        schema: col.0 .0.clone(),
+        table: col.0 .1.clone(),
+        column: col.1.clone(),
+    }
+}
+
+fn join_on(j: &Join) -> Option<&Expr> {
+    match &j.join_operator {
+        JoinOperator::Inner(JoinConstraint::On(e))
+        | JoinOperator::LeftOuter(JoinConstraint::On(e))
+        | JoinOperator::RightOuter(JoinConstraint::On(e))
+        | JoinOperator::FullOuter(JoinConstraint::On(e)) => Some(e),
+        _ => None,
+    }
+}
+
+fn placeholder_ordinal(expr: &Expr) -> Option<u32> {
+    match expr {
+        Expr::Value(SqlValue::Placeholder(s)) => s.strip_prefix('$')?.parse().ok(),
+        _ => None,
+    }
+}
+
+/// All `$N` ordinals appearing in the raw text (source of truth for coverage).
+fn placeholder_ordinals(sql: &str) -> Vec<u32> {
+    let bytes = sql.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > i + 1 {
+                if let Ok(n) = sql[i + 1..j].parse::<u32>() {
+                    out.push(n);
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Substitute `$N` tokens with their literals. Replaces highest ordinals first
+/// so `$1` never matches inside `$10`.
+fn substitute_placeholders(sql: &str, subs: &HashMap<u32, String>) -> String {
+    let mut ords: Vec<&u32> = subs.keys().collect();
+    ords.sort_by(|a, b| b.cmp(a));
+    let mut out = sql.to_string();
+    for ord in ords {
+        out = out.replace(&format!("${ord}"), &subs[ord]);
+    }
+    out
+}
+
+/// Sample one existing value from a column as a correctly-escaped SQL literal
+/// (via `quote_nullable`). The resulting unknown-type literal coerces to the
+/// column type in the comparison, giving a representative plan.
+async fn sample_literal(pool: &PgPool, schema: &str, table: &str, column: &str) -> Option<String> {
+    let sql = format!(
+        "SELECT quote_nullable(\"{column}\"::text)
+           FROM \"{schema}\".\"{table}\"
+          WHERE \"{column}\" IS NOT NULL
+          LIMIT 1"
+    );
+    sqlx::query_scalar::<_, Option<String>>(&sql)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten()
 }
 
 // --------------------------------------------------------------------------
@@ -610,6 +848,33 @@ mod tests {
             .sort_columns
             .iter()
             .any(|(c, desc)| c == "created_at" && *desc));
+    }
+
+    #[test]
+    fn analyze_placeholders_classifies_predicate_and_limit() {
+        let binds = analyze_placeholders(
+            "SELECT id FROM student_progress WHERE student_id = $1 ORDER BY created_at DESC LIMIT $2",
+        )
+        .expect("all placeholders classified");
+        assert!(
+            matches!(binds.get(&1), Some(ParamBind::Column { column, .. }) if column == "student_id")
+        );
+        assert!(matches!(binds.get(&2), Some(ParamBind::Limit)));
+    }
+
+    #[test]
+    fn analyze_placeholders_bails_on_unclassifiable() {
+        // $1 is in the SELECT list, not a predicate/limit -> can't concretize.
+        assert!(analyze_placeholders("SELECT $1 FROM student_progress LIMIT $2").is_none());
+    }
+
+    #[test]
+    fn substitute_replaces_longest_ordinal_first() {
+        let mut subs = HashMap::new();
+        subs.insert(1u32, "'a'".to_string());
+        subs.insert(10u32, "'b'".to_string());
+        let out = substitute_placeholders("x = $1 AND y = $10", &subs);
+        assert_eq!(out, "x = 'a' AND y = 'b'");
     }
 
     #[test]
