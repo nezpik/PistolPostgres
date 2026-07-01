@@ -1,0 +1,24 @@
+# Self-contained Postgres for the PistolPostgres prototype.
+# Bundles hypopg + pg_stat_statements so the full evolution loop is reproducible.
+services:
+  postgres:
+    build:
+      context: ./docker
+    image: pistol-postgres:16
+    container_name: pistol-postgres
+    environment:
+      POSTGRES_USER: pistol
+      POSTGRES_PASSWORD: pistol
+      POSTGRES_DB: pistol
+    ports:
+      - "55432:5432"
+    volumes:
+      - pistol-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pistol -d pistol"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pistol-pgdata:

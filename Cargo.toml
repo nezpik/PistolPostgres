@@ -1,0 +1,37 @@
+[package]
+name = "pistol"
+version = "0.1.0"
+edition = "2021"
+description = "PistolPostgres — controlled evolutionary self-optimization on top of Postgres"
+license = "MIT"
+
+[[bin]]
+name = "pistol"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "json", "chrono", "migrate", "macros"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+rand = "0.8"
+rand_chacha = "0.3"
+sqlparser = "0.52"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "1"
+# Optional LLM proposer (Claude via Anthropic Messages API)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
+
+[dev-dependencies]
+proptest = "1"
+
+[features]
+default = []
+# Enables the optional Claude-backed proposer. Requires ANTHROPIC_API_KEY at runtime;
+# falls back to the evolutionary proposer if the key is absent.
+llm = ["dep:reqwest"]
