@@ -44,11 +44,13 @@ reaches your data:
   rank them and pre-filter on predicted cost. Tier 2 then validates the winner
   on **real measured latency** (`EXPLAIN ANALYZE`, best-of-N) — because planner
   cost is only loosely correlated with wall-clock time.
-- **Reversible apply** — changes go in online (`CREATE INDEX CONCURRENTLY`),
-  their rollback DDL is stored *before* apply, and the measured trial keeps the
-  change only if it truly helps — otherwise it auto-rolls-back. With a
-  `shadow_database_url` (a replica/branch) the measurement runs with **zero
-  production impact**; otherwise it's an in-place trial with guaranteed rollback.
+- **Reversible apply** — changes go in online (`CREATE INDEX CONCURRENTLY`) and
+  their rollback DDL is stored *before* apply. A change that measurably helps is
+  **kept**; only a failed or non-improving trial is automatically rolled back.
+  With a `shadow_database_url` (a replica/branch) the measurement runs with
+  **zero production impact** — build/measure/drop happen on the replica and the
+  index is applied to the primary only if it passes; otherwise it's an in-place
+  trial with guaranteed rollback on failure.
 
 Randomness explores; determinism decides.
 

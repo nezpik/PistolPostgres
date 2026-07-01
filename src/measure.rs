@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Row};
+use sqlx::{Executor, PgPool, Row};
 
 use crate::catalog::WorkloadQuery;
 
@@ -128,21 +128,32 @@ pub fn summarize(
 }
 
 async fn exec_time_ms(conn: &mut sqlx::PgConnection, sql: &str) -> anyhow::Result<f64> {
-    // ANALYZE actually executes the query; our workload is read-only SELECTs.
-    let row = sqlx::query(&format!("EXPLAIN (ANALYZE, TIMING, FORMAT JSON) {sql}"))
-        .fetch_one(&mut *conn)
-        .await?;
-    let v: serde_json::Value = match row.try_get::<serde_json::Value, _>(0) {
-        Ok(v) => v,
-        Err(_) => {
-            let s: String = row.try_get(0)?;
-            serde_json::from_str(&s)?
-        }
-    };
-    Ok(v.get(0)
-        .and_then(|p| p.get("Execution Time"))
-        .and_then(|t| t.as_f64())
-        .unwrap_or(f64::MAX))
+    // EXPLAIN (ANALYZE) actually EXECUTES the statement. Run it inside a
+    // read-only transaction so a non-SELECT workload entry (operator error or a
+    // poisoned catalog row) can never mutate data — and always ROLLBACK.
+    (&mut *conn).execute("START TRANSACTION READ ONLY").await?;
+    let measured = async {
+        let row = sqlx::query(&format!("EXPLAIN (ANALYZE, TIMING, FORMAT JSON) {sql}"))
+            .fetch_one(&mut *conn)
+            .await?;
+        let v: serde_json::Value = match row.try_get::<serde_json::Value, _>(0) {
+            Ok(v) => v,
+            Err(_) => {
+                let s: String = row.try_get(0)?;
+                serde_json::from_str(&s)?
+            }
+        };
+        Ok::<f64, anyhow::Error>(
+            v.get(0)
+                .and_then(|p| p.get("Execution Time"))
+                .and_then(|t| t.as_f64())
+                .unwrap_or(f64::MAX),
+        )
+    }
+    .await;
+    // Never commit — we want zero side effects regardless of outcome.
+    let _ = (&mut *conn).execute("ROLLBACK").await;
+    measured
 }
 
 #[cfg(test)]

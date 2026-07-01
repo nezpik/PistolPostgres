@@ -248,12 +248,22 @@ async fn history(pool: &PgPool, limit: i64) -> anyhow::Result<()> {
         return Ok(());
     }
     for h in rows {
+        // Prefer the real measured improvement; fall back to the prediction,
+        // then to n/a. (Matches the nested `measured` shape the engine writes.)
         let actual = h
             .actual_impact
             .as_ref()
-            .and_then(|v| v.get("actual_improvement_pct"))
-            .and_then(|v| v.as_f64())
-            .map(|v| format!("{v:+.1}%"))
+            .and_then(|v| {
+                v.get("measured")
+                    .and_then(|m| m.get("improvement_pct"))
+                    .and_then(|x| x.as_f64())
+                    .map(|x| format!("{x:+.1}% measured"))
+                    .or_else(|| {
+                        v.get("predicted_improvement_pct")
+                            .and_then(|x| x.as_f64())
+                            .map(|x| format!("{x:+.1}% predicted"))
+                    })
+            })
             .unwrap_or_else(|| "n/a".into());
         println!(
             "#{:<4} {}  [{}]  {} {}  actual={}",

@@ -189,27 +189,68 @@ pub async fn run_once(pool: &PgPool, config: &Config) -> anyhow::Result<CycleRep
         "note": trial.note,
     });
 
-    let history_id = catalog::insert_history(
-        pool,
-        &NewHistory {
-            proposal_id: best.id.clone(),
-            change_type: best.change_type.clone(),
-            target_object: best.target_object.clone(),
-            ddl_executed: best.ddl.clone(),
-            rationale: best.rationale.clone(),
-            before_metrics: serde_json::to_value(&eval)?,
-            after_metrics: actual_impact.clone(),
-            actual_impact: actual_impact.clone(),
-            rollback_ddl: best.index.drop_ddl(true),
-            triggered_by: "auto".into(),
-            genome_context: serde_json::to_value(&genome.indexes)?,
-        },
-    )
-    .await?;
+    // Record provenance and (if kept) update the genome. If any of these writes
+    // fail AFTER the index was applied, compensate by dropping the index so the
+    // physical state can't diverge from an incomplete catalog (which the
+    // idempotency guard would otherwise mask).
+    let persist: anyhow::Result<i64> = async {
+        let history_id = catalog::insert_history(
+            pool,
+            &NewHistory {
+                proposal_id: best.id.clone(),
+                change_type: best.change_type.clone(),
+                target_object: best.target_object.clone(),
+                ddl_executed: best.ddl.clone(),
+                rationale: best.rationale.clone(),
+                before_metrics: serde_json::to_value(&eval)?,
+                after_metrics: actual_impact.clone(),
+                actual_impact: actual_impact.clone(),
+                rollback_ddl: best.index.drop_ddl(true),
+                triggered_by: "auto".into(),
+                genome_context: serde_json::to_value(&genome.indexes)?,
+            },
+        )
+        .await?;
+
+        if !trial.kept {
+            catalog::mark_history_rolledback(pool, history_id, &actual_impact).await?;
+            catalog::link_proposal_history(pool, &best.id, history_id, "rolled_back").await?;
+        } else {
+            catalog::link_proposal_history(pool, &best.id, history_id, "applied").await?;
+            let mut new_genome = genome.clone();
+            new_genome.indexes.push(best.index.clone());
+            catalog::save_current_genome(
+                pool,
+                &new_genome,
+                &json!({
+                    "last_change": best.index.signature(),
+                    "measured_improvement_pct": trial.impact.as_ref().map(|m| m.improvement_pct),
+                    "predicted_improvement_pct": eval.predicted_improvement_pct,
+                    "fitness": best.fitness,
+                }),
+            )
+            .await?;
+        }
+        Ok(history_id)
+    }
+    .await;
+
+    let history_id = match persist {
+        Ok(id) => id,
+        Err(e) => {
+            if trial.kept {
+                let _ = apply::drop_index_online(pool, &best.index).await;
+                tracing::error!(
+                    index = %best.index.index_name(),
+                    error = %e,
+                    "post-apply catalog write failed; dropped the applied index to stay consistent"
+                );
+            }
+            return Err(e);
+        }
+    };
 
     if !trial.kept {
-        catalog::mark_history_rolledback(pool, history_id, &actual_impact).await?;
-        catalog::link_proposal_history(pool, &best.id, history_id, "rolled_back").await?;
         return Ok(CycleReport {
             proposals: 1,
             applied: None,
@@ -217,22 +258,6 @@ pub async fn run_once(pool: &PgPool, config: &Config) -> anyhow::Result<CycleRep
             message: format!("{}: {}", best.index.index_name(), trial.note),
         });
     }
-
-    // 9. Kept — update the active genome.
-    catalog::link_proposal_history(pool, &best.id, history_id, "applied").await?;
-    let mut new_genome = genome.clone();
-    new_genome.indexes.push(best.index.clone());
-    catalog::save_current_genome(
-        pool,
-        &new_genome,
-        &json!({
-            "last_change": best.index.signature(),
-            "measured_improvement_pct": trial.impact.as_ref().map(|m| m.improvement_pct),
-            "predicted_improvement_pct": eval.predicted_improvement_pct,
-            "fitness": best.fitness,
-        }),
-    )
-    .await?;
 
     let measured = trial
         .impact
@@ -301,7 +326,15 @@ async fn measured_trial(
 
     let baseline = measure::measure(target, workload, mcfg.samples).await?;
     apply::build_index_online(target, index).await?;
-    let candidate = measure::measure(target, workload, mcfg.samples).await?;
+    // The trial index now exists on `target`; ensure it is removed on any error
+    // path below, not just the normal keep/reject branches.
+    let candidate = match measure::measure(target, workload, mcfg.samples).await {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = apply::drop_index_online(target, index).await;
+            return Err(e);
+        }
+    };
     let impact = measure::summarize(
         &baseline,
         &candidate,
@@ -322,8 +355,15 @@ async fn measured_trial(
 
     match shadow {
         Some(sp) => {
-            // Never leave the trial index on the replica.
-            let _ = apply::drop_index_online(&sp, index).await;
+            // Never leave the trial index on the replica; surface (don't ignore)
+            // a failed cleanup so a stray replica index is visible.
+            if let Err(e) = apply::drop_index_online(&sp, index).await {
+                tracing::warn!(
+                    index = %index.index_name(),
+                    error = %e,
+                    "failed to drop trial index on shadow replica"
+                );
+            }
             if passed {
                 apply::build_index_online(pool, index).await?;
                 Ok(Trial {

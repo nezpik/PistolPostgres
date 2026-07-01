@@ -171,6 +171,32 @@ async fn end_to_end_evolution_cycle() {
         "tampering with the audit log must be rejected"
     );
 
+    // --- Measurement is read-only: a mutating workload entry can't change data ---
+    sqlx::raw_sql(
+        "CREATE TABLE IF NOT EXISTS public.ro_probe(x int);
+         TRUNCATE public.ro_probe;
+         INSERT INTO public.ro_probe VALUES (1);",
+    )
+    .execute(&pool)
+    .await
+    .expect("ro_probe setup");
+    let mutating = vec![catalog::WorkloadQuery {
+        fingerprint: "mut".into(),
+        query_text: "DELETE FROM public.ro_probe".into(),
+        weight: 1.0,
+        label: None,
+    }];
+    let res = measure::measure(&pool, &mutating, 1).await;
+    assert!(
+        res.is_err(),
+        "a mutating statement must be rejected under read-only measurement"
+    );
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM public.ro_probe")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 1, "read-only measurement must not mutate data");
+
     // --- Measured gate auto-rolls-back when the bar can't be met ---
     // An impossibly high improvement bar forces the in-place trial to roll back
     // whichever candidate it picks.

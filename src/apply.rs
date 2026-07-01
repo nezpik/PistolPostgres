@@ -14,12 +14,18 @@ pub async fn build_index_online(pool: &PgPool, index: &IndexSpec) -> anyhow::Res
     let ddl = index.create_ddl(true);
     let mut conn = pool.acquire().await?;
     if let Err(e) = (&mut *conn).execute(ddl.as_str()).await {
-        // A failed concurrent build can leave an INVALID index — clean it up.
-        let _ = (&mut *conn).execute(index.drop_ddl(true).as_str()).await;
+        // A failed concurrent build can leave an INVALID index behind. Only drop
+        // *that* — never a valid index a concurrent run may have created under
+        // the same (deterministic) name.
+        if index_is_invalid(pool, &index.schema, &index.index_name())
+            .await
+            .unwrap_or(false)
+        {
+            let _ = (&mut *conn).execute(index.drop_ddl(true).as_str()).await;
+        }
         return Err(anyhow::anyhow!("index build failed: {e}"));
     }
-    let analyze = format!("ANALYZE {}", index.qualified_table());
-    let _ = (&mut *conn).execute(analyze.as_str()).await;
+    analyze(&mut conn, index).await;
     Ok(())
 }
 
@@ -27,19 +33,52 @@ pub async fn build_index_online(pool: &PgPool, index: &IndexSpec) -> anyhow::Res
 pub async fn drop_index_online(pool: &PgPool, index: &IndexSpec) -> anyhow::Result<()> {
     let mut conn = pool.acquire().await?;
     (&mut *conn).execute(index.drop_ddl(true).as_str()).await?;
-    let analyze = format!("ANALYZE {}", index.qualified_table());
-    let _ = (&mut *conn).execute(analyze.as_str()).await;
+    analyze(&mut conn, index).await;
     Ok(())
 }
 
-/// The real on-disk size of a built index (bytes), or 0 if absent.
+/// Refresh planner stats after DDL. Best-effort: a failure here doesn't
+/// invalidate the DDL, but we surface it (stale stats can skew the next plan).
+async fn analyze(conn: &mut sqlx::PgConnection, index: &IndexSpec) {
+    let sql = format!("ANALYZE {}", index.qualified_table());
+    if let Err(e) = (&mut *conn).execute(sql.as_str()).await {
+        tracing::warn!(
+            table = %index.qualified_table(),
+            error = %e,
+            "ANALYZE after DDL failed; planner stats may be stale"
+        );
+    }
+}
+
+/// True only if an index with this name exists AND is marked invalid.
+async fn index_is_invalid(pool: &PgPool, schema: &str, name: &str) -> anyhow::Result<bool> {
+    let invalid: Option<bool> = sqlx::query_scalar(
+        "SELECT NOT i.indisvalid
+           FROM pg_index i
+           JOIN pg_class c ON c.oid = i.indexrelid
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = $1 AND c.relname = $2",
+    )
+    .bind(schema)
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(invalid.unwrap_or(false))
+}
+
+/// The real on-disk size of a built index (bytes). Returns 0 only when the index
+/// genuinely does not exist; other errors propagate.
 pub async fn index_size_bytes(pool: &PgPool, index: &IndexSpec) -> anyhow::Result<i64> {
-    let size: i64 = sqlx::query_scalar("SELECT pg_relation_size($1::regclass)")
+    match sqlx::query_scalar::<_, i64>("SELECT pg_relation_size($1::regclass)")
         .bind(format!("\"{}\".\"{}\"", index.schema, index.index_name()))
         .fetch_one(pool)
         .await
-        .unwrap_or(0);
-    Ok(size)
+    {
+        Ok(size) => Ok(size),
+        // 42P01 = undefined_table: the regclass name does not resolve.
+        Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("42P01") => Ok(0),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Execute a stored rollback DDL on demand (used by `pistol rollback <id>`).
