@@ -108,6 +108,7 @@ These subcommands double as the "Hermes tool" seam from the blueprint (§6).
 | `pistol collect` | Take a telemetry snapshot; show derived index candidates. |
 | `pistol propose` | Run the evolutionary search; print ranked proposals (no changes). |
 | `pistol run [--watch --interval N]` | Run the full cycle once, or continuously. |
+| `pistol reconcile` | Repair physical-index vs catalog drift after a crash (also runs automatically at the start of `run`). |
 | `pistol status` | Active genome and evolution counters. |
 | `pistol history [--limit N]` | Applied & rolled-back changes with rationale + rollback DDL. |
 | `pistol rollback <id>` | Undo a previously applied change on demand. |

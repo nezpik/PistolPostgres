@@ -37,6 +37,15 @@ pub async fn drop_index_online(pool: &PgPool, index: &IndexSpec) -> anyhow::Resu
     Ok(())
 }
 
+/// Drop an index online by schema-qualified name (used by reconciliation, which
+/// works from catalog/physical names rather than a full `IndexSpec`).
+pub async fn drop_index_by_name(pool: &PgPool, schema: &str, name: &str) -> anyhow::Result<()> {
+    let ddl = format!("DROP INDEX CONCURRENTLY IF EXISTS \"{schema}\".\"{name}\"");
+    let mut conn = pool.acquire().await?;
+    (&mut *conn).execute(ddl.as_str()).await?;
+    Ok(())
+}
+
 /// Refresh planner stats after DDL. Best-effort: a failure here doesn't
 /// invalidate the DDL, but we surface it (stale stats can skew the next plan).
 async fn analyze(conn: &mut sqlx::PgConnection, index: &IndexSpec) {

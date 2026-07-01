@@ -191,6 +191,29 @@ identical-index dedup, min predicted improvement, max regression, per-table
 index cap, daily storage budget. Autonomy levels: `advisory` (record only),
 `auto_safe`, `auto_broad`. Overrides from `pistol.policies` layer over config.
 
+## Crash reconciliation (`src/reconcile.rs`)
+
+The engine's compensating writes handle the *error* path, but a crash
+(SIGKILL / power loss) between `CREATE INDEX CONCURRENTLY` and the catalog write
+can still leave the physical schema and the `pistol.*` catalog out of sync.
+`pistol reconcile` (also run automatically at the start of `run`) repairs it,
+touching **only** pistol-managed `pi_*` indexes — never a user index:
+
+- an **INVALID** `pi_*` index (Postgres leaves these when a concurrent build
+  crashes) → dropped;
+- a valid `pi_*` index **with** applied provenance (an `evolution_history` row) →
+  kept;
+- a valid `pi_*` index **without** provenance (built before the catalog write) →
+  dropped, since it was never verified/recorded; the loop re-derives it;
+- an applied-history index that's **gone** physically → its history row is marked
+  `rolled_back` so the audit log stays honest;
+- `current_genome` is rebuilt from the provenanced, physically-present set
+  (IndexSpecs are read back from the originating proposal JSON — no DDL parsing).
+
+The keep/drop decision is a pure function (`classify_index`) so it's unit-tested;
+the DB effects are covered by the integration test (orphan drop, out-of-band drop
+→ genome rebuild).
+
 ## Testing
 
 - **Unit** (`src/genome.rs`, `src/policy.rs`, `src/measure.rs`): identifier
