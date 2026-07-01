@@ -1,126 +1,84 @@
-//! Apply & Feedback loop (blueprint §4.6). Applies a change online, stores its
-//! reversal DDL, then verifies the real-world impact and auto-rolls-back on
-//! regression. This is where "reliable" self-modification actually happens.
+//! Online, reversible DDL primitives (blueprint §4.6). The engine composes
+//! these into a measured trial: build → measure → keep or drop. Everything here
+//! is online (`CONCURRENTLY`) and every build has a matching, pre-computed undo.
 
-use std::collections::HashMap;
-
-use serde_json::{json, Value};
 use sqlx::{Executor, PgPool};
 
-use crate::catalog::WorkloadQuery;
-use crate::evaluator::{plan_total_cost, Evaluation};
 use crate::genome::IndexSpec;
 
-#[derive(Debug)]
-pub struct ApplyOutcome {
-    pub index_name: String,
-    pub ddl_executed: String,
-    pub rollback_ddl: String,
-    pub actual_impact: Value,
-    pub rolled_back: bool,
+/// Build an index online. `CREATE INDEX CONCURRENTLY` cannot run inside a
+/// transaction block, so it is sent via the simple query protocol (passing
+/// `&str` to `execute` runs it unprepared / autocommit). Refreshes planner
+/// stats afterwards so the new index is actually considered.
+pub async fn build_index_online(pool: &PgPool, index: &IndexSpec) -> anyhow::Result<()> {
+    let ddl = index.create_ddl(true);
+    let mut conn = pool.acquire().await?;
+    if let Err(e) = (&mut *conn).execute(ddl.as_str()).await {
+        // A failed concurrent build can leave an INVALID index behind. Only drop
+        // *that* — never a valid index a concurrent run may have created under
+        // the same (deterministic) name.
+        if index_is_invalid(pool, &index.schema, &index.index_name())
+            .await
+            .unwrap_or(false)
+        {
+            let _ = (&mut *conn).execute(index.drop_ddl(true).as_str()).await;
+        }
+        return Err(anyhow::anyhow!("index build failed: {e}"));
+    }
+    analyze(&mut conn, index).await;
+    Ok(())
 }
 
-/// Apply the index online (`CREATE INDEX CONCURRENTLY`), then measure real plan
-/// costs and roll back automatically if any query regressed beyond the gate.
-pub async fn apply_and_monitor(
-    pool: &PgPool,
-    index: &IndexSpec,
-    before_eval: &Evaluation,
-    workload: &[WorkloadQuery],
-    max_regression_pct: f64,
-) -> anyhow::Result<ApplyOutcome> {
-    let ddl_executed = index.create_ddl(true);
-    let rollback_ddl = index.drop_ddl(true);
-    let index_name = index.index_name();
-
-    // CREATE INDEX CONCURRENTLY cannot run inside a transaction block, so we
-    // use the simple query protocol on a dedicated connection (passing &str to
-    // execute() runs it unprepared / autocommit).
+/// Drop an index online (the reversal of `build_index_online`).
+pub async fn drop_index_online(pool: &PgPool, index: &IndexSpec) -> anyhow::Result<()> {
     let mut conn = pool.acquire().await?;
-    if let Err(e) = (&mut *conn).execute(ddl_executed.as_str()).await {
-        // A failed CONCURRENTLY build can leave an INVALID index — clean it up.
-        let _ = (&mut *conn).execute(rollback_ddl.as_str()).await;
-        return Err(anyhow::anyhow!("apply failed: {e}"));
-    }
+    (&mut *conn).execute(index.drop_ddl(true).as_str()).await?;
+    analyze(&mut conn, index).await;
+    Ok(())
+}
 
-    // Refresh planner statistics so the new index is actually considered.
-    let analyze = format!("ANALYZE {}", index.qualified_table());
-    let _ = (&mut *conn).execute(analyze.as_str()).await;
-
-    // Measure real post-apply plan costs vs the pre-apply baseline.
-    let before: HashMap<&str, f64> = before_eval
-        .per_query
-        .iter()
-        .map(|d| (d.fingerprint.as_str(), d.baseline_cost))
-        .collect();
-    let weights: HashMap<&str, f64> = workload
-        .iter()
-        .map(|w| (w.fingerprint.as_str(), w.weight))
-        .collect();
-
-    let mut per_query = Vec::new();
-    let mut before_total = 0.0;
-    let mut after_total = 0.0;
-    let mut worst_regression_pct: f64 = 0.0;
-
-    for w in workload {
-        let b = *before.get(w.fingerprint.as_str()).unwrap_or(&0.0);
-        let a = plan_total_cost(&mut conn, &w.query_text).await?;
-        let weight = *weights.get(w.fingerprint.as_str()).unwrap_or(&1.0);
-        before_total += b * weight;
-        after_total += a * weight;
-        let improvement_pct = if b > 0.0 { (b - a) / b * 100.0 } else { 0.0 };
-        worst_regression_pct = worst_regression_pct.max(-improvement_pct);
-        per_query.push(json!({
-            "fingerprint": w.fingerprint,
-            "label": w.label,
-            "before_cost": b,
-            "after_cost": a,
-            "improvement_pct": improvement_pct,
-        }));
-    }
-
-    let actual_improvement_pct = if before_total > 0.0 {
-        (before_total - after_total) / before_total * 100.0
-    } else {
-        0.0
-    };
-
-    let real_size: i64 = sqlx::query_scalar("SELECT pg_relation_size($1::regclass)")
-        .bind(format!("\"{}\".\"{}\"", index.schema, index_name))
-        .fetch_one(&mut *conn)
-        .await
-        .unwrap_or(0);
-
-    let mut rolled_back = false;
-    if worst_regression_pct > max_regression_pct {
-        // Regression detected in production — undo immediately.
+/// Refresh planner stats after DDL. Best-effort: a failure here doesn't
+/// invalidate the DDL, but we surface it (stale stats can skew the next plan).
+async fn analyze(conn: &mut sqlx::PgConnection, index: &IndexSpec) {
+    let sql = format!("ANALYZE {}", index.qualified_table());
+    if let Err(e) = (&mut *conn).execute(sql.as_str()).await {
         tracing::warn!(
-            index = %index_name,
-            worst_regression_pct,
-            "post-apply regression exceeded gate; rolling back"
+            table = %index.qualified_table(),
+            error = %e,
+            "ANALYZE after DDL failed; planner stats may be stale"
         );
-        (&mut *conn).execute(rollback_ddl.as_str()).await?;
-        let _ = (&mut *conn).execute(analyze.as_str()).await;
-        rolled_back = true;
     }
+}
 
-    let actual_impact = json!({
-        "predicted_improvement_pct": before_eval.predicted_improvement_pct,
-        "actual_improvement_pct": actual_improvement_pct,
-        "worst_regression_pct": worst_regression_pct,
-        "real_index_size_bytes": real_size,
-        "auto_rolled_back": rolled_back,
-        "per_query": per_query,
-    });
+/// True only if an index with this name exists AND is marked invalid.
+async fn index_is_invalid(pool: &PgPool, schema: &str, name: &str) -> anyhow::Result<bool> {
+    let invalid: Option<bool> = sqlx::query_scalar(
+        "SELECT NOT i.indisvalid
+           FROM pg_index i
+           JOIN pg_class c ON c.oid = i.indexrelid
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = $1 AND c.relname = $2",
+    )
+    .bind(schema)
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(invalid.unwrap_or(false))
+}
 
-    Ok(ApplyOutcome {
-        index_name,
-        ddl_executed,
-        rollback_ddl,
-        actual_impact,
-        rolled_back,
-    })
+/// The real on-disk size of a built index (bytes). Returns 0 only when the index
+/// genuinely does not exist; other errors propagate.
+pub async fn index_size_bytes(pool: &PgPool, index: &IndexSpec) -> anyhow::Result<i64> {
+    match sqlx::query_scalar::<_, i64>("SELECT pg_relation_size($1::regclass)")
+        .bind(format!("\"{}\".\"{}\"", index.schema, index.index_name()))
+        .fetch_one(pool)
+        .await
+    {
+        Ok(size) => Ok(size),
+        // 42P01 = undefined_table: the regclass name does not resolve.
+        Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("42P01") => Ok(0),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Execute a stored rollback DDL on demand (used by `pistol rollback <id>`).

@@ -8,11 +8,15 @@ leaves the Postgres storage engine, MVCC, WAL, and planner completely untouched
 Intelligence Layer** that continuously:
 
 ```
- collect telemetry ─▶ propose (evolutionary search) ─▶ evaluate (hypopg, zero-cost)
+ collect telemetry ─▶ propose (evolutionary search) ─▶ Tier 1: hypopg estimate (zero-cost pre-filter)
         ▲                                                          │
         │                                                          ▼
-   record + learn ◀── monitor + auto-rollback ◀── apply online ◀── policy gate
+   record + learn ◀── keep or auto-rollback ◀── Tier 2: MEASURED latency (EXPLAIN ANALYZE) ◀── policy pre-gate
 ```
+
+The decision to keep a change is made on **measured latency**, not the
+optimizer's estimate — hypopg only cheaply pre-filters which candidate is worth
+measuring.
 
 Every step is recorded as first-class, queryable rows in `pistol.*` catalog
 tables, so the self-modification is fully auditable and reversible.
@@ -35,12 +39,18 @@ reaches your data:
   `evolution.seed` gives byte-for-byte identical proposals (used in tests and
   demos); seed `0` draws from OS entropy for real exploration in production.
   Ranking ties break on a stable key, so a seed fully determines the outcome.
-- **Deterministic gate** — every candidate is evaluated with **hypopg**
-  (hypothetical indexes that only affect the planner, cost nothing, touch no
-  data) and must clear declarative **policy gates** before it can be applied.
-- **Reversible apply** — changes go in online (`CREATE INDEX CONCURRENTLY`),
-  their rollback DDL is stored *before* apply, and a post-apply monitor
-  auto-rolls-back on any real regression.
+- **Two-tier gate** — Tier 1 evaluates candidates with **hypopg** (hypothetical
+  indexes that only affect the planner, cost nothing, touch no data) to cheaply
+  rank them and pre-filter on predicted cost. Tier 2 then validates the winner
+  on **real measured latency** (`EXPLAIN ANALYZE`, best-of-N) — because planner
+  cost is only loosely correlated with wall-clock time.
+- **Reversible apply** — changes go in online (`CREATE INDEX CONCURRENTLY`) and
+  their rollback DDL is stored *before* apply. A change that measurably helps is
+  **kept**; only a failed or non-improving trial is automatically rolled back.
+  With a `shadow_database_url` (a replica/branch) the measurement runs with
+  **zero production impact** — build/measure/drop happen on the replica and the
+  index is applied to the primary only if it passes; otherwise it's an in-place
+  trial with guaranteed rollback on failure.
 
 Randomness explores; determinism decides.
 
@@ -138,15 +148,19 @@ cargo run --features llm -- run   # with PISTOL_PROPOSER=llm to select it
 
 ## Safety model (defense in depth)
 
-1. Zero-cost evaluation (hypopg) before anything touches production.
-2. Declarative policy gates: min improvement, max regression, per-table index
-   caps, daily storage budget, protected schemas, graduated autonomy
-   (`advisory` → `auto_safe` → `auto_broad`).
+1. Tier 1 — zero-cost hypopg evaluation + declarative policy pre-filter before
+   anything touches production (min improvement, per-table index caps, daily
+   storage budget, protected schemas, graduated autonomy `advisory` →
+   `auto_safe` → `auto_broad`).
+2. Tier 2 — real measured-latency gate (best-of-N `EXPLAIN ANALYZE`, with a
+   noise floor so timing jitter can't force false rollbacks); on a shadow
+   replica for zero impact, else in-place with guaranteed rollback.
 3. Online-first apply (`CREATE INDEX CONCURRENTLY`); never bypasses Postgres'
    transaction/recovery model.
-4. Rollback DDL stored *before* apply; post-apply monitor auto-rolls-back on
-   regression; manual `rollback` any time.
-5. Immutable, append-only audit log (enforced by a DB trigger).
+4. Rollback DDL stored *before* apply; the trial keeps only measured-good
+   changes; manual `rollback` any time.
+5. Immutable, append-only audit log (enforced by a DB trigger) recording
+   **predicted vs measured** for every change.
 
 ---
 

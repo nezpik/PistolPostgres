@@ -70,10 +70,14 @@ impl LlmProposer {
                 })
                 .collect::<Vec<_>>(),
         )?;
+        // Do NOT send raw workload SQL (it can contain literals / tenant data)
+        // to an external service; the extracted predicate metadata in
+        // `candidates_json` already carries the structural signal the model
+        // needs. Only fingerprints + weights are shared.
         let workload_json = serde_json::to_string_pretty(
             &ctx.workload
                 .iter()
-                .map(|w| serde_json::json!({ "weight": w.weight, "sql": w.query_text }))
+                .map(|w| serde_json::json!({ "fingerprint": w.fingerprint, "weight": w.weight }))
                 .collect::<Vec<_>>(),
         )?;
 
@@ -91,7 +95,9 @@ impl LlmProposer {
             "messages": [{ "role": "user", "content": prompt }],
         });
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
         let resp = client
             .post(format!("{base}/v1/messages"))
             .header("x-api-key", api_key)

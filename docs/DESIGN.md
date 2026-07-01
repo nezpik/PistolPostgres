@@ -115,15 +115,51 @@ For non-`public` schemas, set the schema on your connection string
 (`?options=-csearch_path=myschema,public`). Real DDL (`CREATE INDEX
 CONCURRENTLY`, `pg_relation_size`) uses normal schema-qualified names.
 
-## Apply & feedback (`src/apply.rs`)
+## Measured gate (`src/measure.rs`, `engine.rs::measured_trial`) — the decision-maker
 
-`CREATE INDEX CONCURRENTLY` cannot run inside a transaction block, so it is sent
-via the simple query protocol (passing `&str` to sqlx's `execute`) on a
-dedicated pooled connection. The rollback DDL (`DROP INDEX CONCURRENTLY IF
-EXISTS`) is computed and stored **before** apply. After building, we `ANALYZE`
-the table and re-measure real plan costs; if the worst regression exceeds the
-gate, we immediately run the rollback. A failed concurrent build (which can
-leave an `INVALID` index) is cleaned up.
+hypopg's estimated cost is excellent for cheaply *ranking* hundreds of
+candidates, but planner cost units are only loosely correlated with wall-clock
+latency — gating on them alone would let confidently-wrong changes through. So
+the loop is **two-tier**:
+
+- **Tier 1 (estimated, no impact):** the evolutionary search + a policy
+  pre-filter, both on hypopg cost. Picks the single best candidate.
+- **Tier 2 (measured, reversible):** build the winner, then measure real
+  `EXPLAIN (ANALYZE)` latency across the weighted workload and keep it only if
+  the measurement agrees.
+
+Making measurement reliable is the hard part. Three techniques:
+
+1. **Best-of-N, not mean/median.** Interference (autovacuum, other queries) can
+   only ever *add* time, so the fastest observed run is the least-noisy estimate
+   of true cost. We run `samples + 1` times, discard the cold warm-up, and take
+   the minimum.
+2. **Noise floor.** A query whose baseline is below `noise_floor_ms` is too fast
+   to time reliably (sub-millisecond jitter reads as a huge %), so it cannot
+   veto a change. Regression also requires an absolute slowdown above the floor,
+   not just a relative %.
+3. **Realistic in-place tolerance.** Building the index evicts buffer-cache
+   pages, so unrelated queries can read slightly slower in the post-build
+   window. An in-place trial therefore uses a tolerant `max_measured_regression_pct`
+   that catches only egregious (plan-flip) regressions. Pointing
+   `shadow_database_url` at a quiet replica/branch removes this perturbation and
+   lets you tighten the threshold toward a few percent — and gives **zero
+   production impact**, since the trial builds/measures/drops on the replica and
+   only applies to the primary if the replica passes.
+
+Provenance records both `predicted_improvement_pct` (hypopg) and the full
+`measured` impact, so the estimate-vs-reality gap is always visible in
+`pistol.evolution_history`.
+
+## Apply primitives (`src/apply.rs`)
+
+`build_index_online` / `drop_index_online` are the online, reversible building
+blocks the measured trial composes. `CREATE INDEX CONCURRENTLY` cannot run
+inside a transaction block, so it is sent via the simple query protocol (passing
+`&str` to sqlx's `execute`) on a dedicated pooled connection, then the table is
+`ANALYZE`d so the new index is actually considered. The rollback DDL (`DROP
+INDEX CONCURRENTLY IF EXISTS`) is computed and stored **before** apply, and a
+failed concurrent build (which can leave an `INVALID` index) is cleaned up.
 
 ## Policy (`src/policy.rs`)
 
@@ -134,22 +170,27 @@ index cap, daily storage budget. Autonomy levels: `advisory` (record only),
 
 ## Testing
 
-- **Unit** (`src/genome.rs`, `src/policy.rs`): identifier bounds/determinism,
-  DDL shaping, overlap detection, every policy gate, override merging.
+- **Unit** (`src/genome.rs`, `src/policy.rs`, `src/measure.rs`): identifier
+  bounds/determinism, DDL shaping, overlap detection, every policy gate, override
+  merging, and the measured-gate math (weighted summary, noise-floor exclusion,
+  best-of-N reduction).
 - **Property** (`tests/property.rs`, `proptest`): index-name bounds &
   determinism, DDL well-formedness, overlap reflexivity across random specs.
 - **Integration** (`tests/integration.rs`, gated on `PISTOL_TEST_DATABASE_URL`):
-  migrations, candidate extraction, **seed reproducibility**, a full applying
-  cycle with provenance, and the **auto-rollback** path (forced with a negative
-  regression gate).
+  migrations, candidate extraction, **seed reproducibility**, a directly-measured
+  index win, a full applying cycle validated by **measured latency** with
+  predicted-vs-measured provenance, and the **measured auto-rollback** path
+  (forced with an unmeetable improvement bar).
 
 ## Known limitations / future work
 
 - Change types limited to B-tree indexes; MV/partition/schema-extension seams
   exist but are unimplemented.
-- Cost model is the Postgres planner's estimate (via hypopg), not measured
-  latency; a replay/branch-based harness (blueprint §4.3) would tighten this.
-- No Supabase branch integration, no learned cost models, no pgrx extension yet
-  (blueprint Phases 2–3).
+- The measured gate uses real `EXPLAIN (ANALYZE)` latency, but on the *registered
+  representative* workload; automatic capture of concrete production queries
+  (via `auto_explain`/sampling) is the next step to true self-driving.
+- Shadow measurement expects an operator-provided replica/branch URL; we don't
+  yet provision it (blueprint's Supabase-branch integration, Phase 2).
+- No learned cost models, no pgrx in-core extension yet (blueprint Phase 3).
 - Single-node, single evolution loop; multi-tenant per-tenant policies are
   future work.

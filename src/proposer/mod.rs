@@ -74,7 +74,19 @@ impl Proposer {
         match self {
             Proposer::Evolutionary(p) => p.propose(evaluator, ctx).await,
             #[cfg(feature = "llm")]
-            Proposer::Llm(p) => p.propose(evaluator, ctx).await,
+            Proposer::Llm(p) => {
+                // The LLM only suggests; if it returns nothing (no key, empty or
+                // unparseable response), fall back to the always-available
+                // evolutionary proposer so the cycle still makes progress.
+                let proposals = p.propose(evaluator, ctx).await?;
+                if proposals.is_empty() {
+                    evolutionary::EvolutionaryProposer
+                        .propose(evaluator, ctx)
+                        .await
+                } else {
+                    Ok(proposals)
+                }
+            }
         }
     }
 }

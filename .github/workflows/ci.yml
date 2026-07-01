@@ -10,6 +10,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # No step pushes back to the repo; don't leave GITHUB_TOKEN on disk
+          # while running third-party build scripts (cargo build/clippy).
+          persist-credentials: false
 
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy

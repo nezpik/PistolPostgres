@@ -170,25 +170,47 @@ impl EvolutionaryProposer {
 
 fn build_pools(ctx: &ProposalContext<'_>, total_support: f64, max_cols: usize) -> Vec<TablePool> {
     let min_support = ctx.config.evolution.min_column_support * total_support;
-    ctx.candidates
+    // Aggregate by table so every eligible candidate for a table contributes its
+    // columns (guards against duplicate candidates for the same table).
+    let mut by_table: HashMap<(String, String), TablePool> = HashMap::new();
+    for c in ctx
+        .candidates
         .iter()
         .filter(|c| {
             c.support >= min_support && (!c.eq_columns.is_empty() || !c.sort_columns.is_empty())
         })
         .filter(|c| !is_protected(ctx, &c.schema, &c.table))
-        .map(|c| {
-            let key = format!("{}.{}", c.schema, c.table);
-            let writes = ctx.table_stats.get(&key).map(|s| s.writes).unwrap_or(0);
-            TablePool {
+    {
+        let key = format!("{}.{}", c.schema, c.table);
+        let writes = ctx.table_stats.get(&key).map(|s| s.writes).unwrap_or(0);
+        let pool = by_table
+            .entry((c.schema.clone(), c.table.clone()))
+            .or_insert_with(|| TablePool {
                 schema: c.schema.clone(),
                 table: c.table.clone(),
-                eq: c.eq_columns.iter().take(max_cols).cloned().collect(),
-                sort: c.sort_columns.iter().take(max_cols).cloned().collect(),
+                eq: Vec::new(),
+                sort: Vec::new(),
                 writes,
+            });
+        for col in c.eq_columns.iter() {
+            if pool.eq.len() < max_cols && !pool.eq.contains(col) {
+                pool.eq.push(col.clone());
             }
-        })
+        }
+        for col in c.sort_columns.iter() {
+            if pool.sort.len() < max_cols && !pool.sort.contains(col) {
+                pool.sort.push(col.clone());
+            }
+        }
+    }
+    let mut pools: Vec<TablePool> = by_table
+        .into_values()
         .filter(|p| !p.eq.is_empty() || !p.sort.is_empty())
-        .collect()
+        .collect();
+    // HashMap iteration order is nondeterministic; sort so the seeded search is
+    // fully reproducible for a given seed.
+    pools.sort_by(|a, b| (&a.schema, &a.table).cmp(&(&b.schema, &b.table)));
+    pools
 }
 
 fn is_protected(ctx: &ProposalContext<'_>, schema: &str, table: &str) -> bool {
