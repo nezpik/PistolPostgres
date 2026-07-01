@@ -1,0 +1,40 @@
+# PistolPostgres configuration & policies.
+# Every value here can be overridden by an environment variable prefixed with
+# PISTOL_ (e.g. PISTOL_DATABASE_URL) or by rows in the pistol.policies table.
+
+# Connection to the Postgres you want to evolve. The docker-compose maps 5432->55432.
+database_url = "postgres://pistol:pistol@127.0.0.1:55432/pistol"
+
+[evolution]
+# Seed for the stochastic/evolutionary search.
+#   - Set an integer  -> fully reproducible proposals (used by tests & demos).
+#   - Set to 0/absent -> seed from OS entropy (real exploration in production).
+# This is the crux of "non-deterministic yet reliable": randomness is
+# reproducible on demand, never uncontrolled.
+seed = 42
+population_size = 8
+generations = 6
+mutation_rate = 0.6
+max_columns_per_index = 3
+# Candidate columns must appear in at least this fraction of workload weight
+# (filters/joins/sorts) to be considered.
+min_column_support = 0.05
+
+[fitness]
+# Multi-objective weights (blueprint §4.2). Fitness = w_cost * cost_reduction
+#   - w_storage * storage_penalty - w_write_amp * write_penalty
+#   - w_redundancy * redundancy_penalty.
+w_cost = 1.0
+w_storage = 0.15
+w_write_amp = 0.25
+w_redundancy = 0.5
+
+[policy]
+# Declarative safety gates (blueprint §4.4 / §5).
+autonomy_level = "auto_safe"          # advisory | auto_safe | auto_broad
+min_predicted_improvement_pct = 15.0  # apply only if predicted cost drop >= this
+max_regression_pct = 2.0              # reject/rollback if any query worsens beyond this
+max_indexes_per_table = 8
+max_storage_mb_per_day = 2048.0
+protected_schemas = ["auth", "storage", "pg_catalog", "information_schema", "pistol"]
+protected_tables = []
