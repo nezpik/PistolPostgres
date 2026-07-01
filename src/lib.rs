@@ -14,4 +14,5 @@ pub mod genome;
 pub mod measure;
 pub mod policy;
 pub mod proposer;
+pub mod reconcile;
 pub mod telemetry;

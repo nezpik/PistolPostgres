@@ -11,7 +11,7 @@ use pistol::genome::{Genome, IndexColumn, IndexSpec};
 use pistol::measure;
 use pistol::proposer::evolutionary::EvolutionaryProposer;
 use pistol::proposer::ProposalContext;
-use pistol::{apply, catalog, db, demo, engine, telemetry};
+use pistol::{apply, catalog, db, demo, engine, reconcile, telemetry};
 
 fn test_config(url: &str) -> Config {
     Config {
@@ -265,6 +265,56 @@ async fn end_to_end_evolution_cycle() {
         timed.values().next().copied().unwrap_or(f64::MAX) < f64::MAX,
         "concretized captured query should produce a real timing"
     );
+
+    // --- Crash reconciliation ---
+    // (a) An orphan pistol index (built but never recorded — the crash-between-
+    //     DDL-and-catalog case) is dropped.
+    let orphan = IndexSpec::new("enrollments", vec![IndexColumn::asc("class_id")]);
+    apply::build_index_online(&pool, &orphan)
+        .await
+        .expect("build orphan");
+    assert!(apply::index_exists(&pool, "public", &orphan.index_name())
+        .await
+        .unwrap());
+    let rep = reconcile::reconcile(&pool).await.expect("reconcile");
+    assert!(
+        !apply::index_exists(&pool, "public", &orphan.index_name())
+            .await
+            .unwrap(),
+        "orphan pistol index must be dropped by reconcile"
+    );
+    assert!(
+        rep.dropped_orphan
+            .iter()
+            .any(|s| s.ends_with(&orphan.index_name())),
+        "reconcile report should list the dropped orphan"
+    );
+
+    // (b) A provenanced, physically-present index survives and stays in the
+    //     rebuilt genome; if it's dropped out-of-band, reconcile marks it
+    //     rolled_back and removes it from the genome.
+    let genome = catalog::load_current_genome(&pool).await.unwrap();
+    if let Some(applied) = genome.indexes.first().cloned() {
+        assert!(
+            apply::index_exists(&pool, &applied.schema, &applied.index_name())
+                .await
+                .unwrap(),
+            "a genome index should physically exist after reconcile"
+        );
+        // Simulate an out-of-band drop, then reconcile.
+        apply::drop_index_online(&pool, &applied)
+            .await
+            .expect("drop applied");
+        reconcile::reconcile(&pool).await.expect("reconcile 2");
+        let genome2 = catalog::load_current_genome(&pool).await.unwrap();
+        assert!(
+            !genome2
+                .indexes
+                .iter()
+                .any(|i| i.index_name() == applied.index_name()),
+            "an out-of-band-dropped index must be removed from the genome"
+        );
+    }
 }
 
 async fn count_public_indexes(pool: &sqlx::PgPool) -> i64 {

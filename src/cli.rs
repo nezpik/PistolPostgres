@@ -7,7 +7,7 @@ use sqlx::{PgPool, Row};
 use crate::config::Config;
 use crate::evaluator::Evaluator;
 use crate::proposer::{ProposalContext, Proposer};
-use crate::{apply, catalog, db, demo, engine, telemetry};
+use crate::{apply, catalog, db, demo, engine, reconcile, telemetry};
 
 #[derive(Parser)]
 #[command(
@@ -41,6 +41,8 @@ pub enum Command {
     Propose,
     /// Run the full evolution cycle (telemetry→propose→gate→apply→monitor).
     Run(RunArgs),
+    /// Reconcile physical indexes with the catalog after a crash.
+    Reconcile,
     /// Show the active genome and evolution status.
     Status,
     /// Show the evolution history (applied & rolled-back changes).
@@ -131,6 +133,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Collect => collect(&pool).await?,
         Command::Propose => propose(&pool, &config).await?,
         Command::Run(a) => run(&pool, &config, a).await?,
+        Command::Reconcile => reconcile_cmd(&pool).await?,
         Command::Status => status(&pool).await?,
         Command::History(a) => history(&pool, a.limit).await?,
         Command::Rollback(a) => rollback(&pool, a.id).await?,
@@ -210,7 +213,50 @@ async fn propose(pool: &PgPool, config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn reconcile_cmd(pool: &PgPool) -> anyhow::Result<()> {
+    let r = reconcile::reconcile(pool).await?;
+    if r.is_clean() {
+        println!("✓ nothing to reconcile — catalog and schema agree");
+    } else {
+        println!("✓ reconciled:");
+        if !r.dropped_invalid.is_empty() {
+            println!(
+                "    dropped {} invalid index(es): {:?}",
+                r.dropped_invalid.len(),
+                r.dropped_invalid
+            );
+        }
+        if !r.dropped_orphan.is_empty() {
+            println!(
+                "    dropped {} orphan index(es): {:?}",
+                r.dropped_orphan.len(),
+                r.dropped_orphan
+            );
+        }
+        if !r.marked_missing.is_empty() {
+            println!(
+                "    marked {} history row(s) rolled_back (index missing)",
+                r.marked_missing.len()
+            );
+        }
+    }
+    println!("  active genome: {} index(es)", r.genome_indexes);
+    Ok(())
+}
+
 async fn run(pool: &PgPool, config: &Config, args: RunArgs) -> anyhow::Result<()> {
+    // Startup reconciliation: repair any drift left by a previous crash before
+    // the loop trusts the catalog.
+    let rec = reconcile::reconcile(pool).await?;
+    if !rec.is_clean() {
+        println!(
+            "▸ reconciled after prior crash: {} invalid, {} orphan dropped, {} marked missing",
+            rec.dropped_invalid.len(),
+            rec.dropped_orphan.len(),
+            rec.marked_missing.len()
+        );
+    }
+
     if !args.watch {
         let r = engine::run_once(pool, config).await?;
         println!("\n— {}", r.message);
